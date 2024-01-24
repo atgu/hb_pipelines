@@ -1,9 +1,10 @@
 __author__ = 'Sophie Parsa & Lindo Nkambule'
 
 
-import hail as hl
+import argparse
 import hailtop.batch as hb
 import hailtop.fs as hfs
+import os
 from hailtop.batch.job import Job
 from typing import Dict, List, Union
 
@@ -11,67 +12,120 @@ from typing import Dict, List, Union
 # GATK Best Practices
 # https://gatk.broadinstitute.org/hc/en-us/articles/360035535912-Data-pre-processing-for-variant-discovery
 # https://github.com/gatk-workflows/broad-prod-wgs-germline-snps-indels/blob/master/PairedEndSingleSampleWf-fc-hg38.wdl
-inputs = {"ref_fasta": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta",
-          "ref_fasta_index": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.fai",
-          "ref_dict": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dict",
-          "wgs_calling_interval_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.interval_list",
-          "calling_int_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.interval_list",
-          "eval_int_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_evaluation_regions.hg38.interval_list",
-          "dbsnp_resource_vcf": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.gz",
-          "known_indels_sites_VCFs": [
-              "gs://gcp-public-data--broad-references/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
-              "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.known_indels.vcf.gz"
-          ],
-          "contamination_sites_ud": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.UD",
-          "contamination_sites_bed": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.bed",
-          "contamination_sites_mu": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.mu",
-          "gatk_img": "us.gcr.io/broad-gatk/gatk:4.2.0.0",
-          "haplotype_scatter_count": 50,
-          "break_bands_at_multiples_of": 1000000,
-          "hc_contamination": 0}
+inputs = {
+    "ref_fasta": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta",
+    "ref_fasta_index": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.fai",
+    "ref_dict": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dict",
+    "ref_alt": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.alt",
+    "ref_sa": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.sa",
+    "ref_amb": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.amb",
+    "ref_bwt": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.bwt",
+    "ref_ann": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.ann",
+    "ref_pac": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta.64.pac",
+    "wgs_calling_interval_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.interval_list",
+    "calling_int_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_calling_regions.hg38.interval_list",
+    "eval_int_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_evaluation_regions.hg38.interval_list",
+    "dbSNP_vcf": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.gz",
+    "known_indels_sites_VCFs": [
+        "gs://gcp-public-data--broad-references/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
+        "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.known_indels.vcf.gz"
+    ],
+    "contamination_sites_ud": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.UD",
+    "contamination_sites_bed": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.bed",
+    "contamination_sites_mu": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.contam.mu",
+    }
 
 
-def get_file_size(file):
-    """Get file size"""
+def size(file: str):
+    """
+    Convert the size from bytes to GiB
+    :param file: path to file, str
+    :return: file size in GiB
+    """
 
-    file_info = hl.utils.hadoop_stat(file)
-    size_bytes = file_info['size_bytes']
+    file_info = hfs.stat(file)   # returns a named tuple
+    size_bytes = file_info.size
     size_gigs = size_bytes / (1024 * 1024 * 1024)
 
     return size_gigs
 
 
+# Assume out_dir and tmp_dir are different, and write every intermediate file to tmp_dir and final files to out_dir
+
+# 1. Get read groups in a BAM file, so we can parallelize mapping
+def get_read_groups(
+        b: hb.batch.Batch,
+        input_bam: hb.ResourceFile = None,
+        output_bam_prefix: str = None,
+        memory: str = 'lowmem',
+        ncpu: int = 4,
+        storage: int = None,
+        img: str = 'docker.io/broadinstitute/gatk:latest',
+        tmp_dir: str = None
+) -> Job:
+    """
+    Get read group IDs from a BAM file
+    :param b: batch
+    :param input_bam: input BAM file
+    :param output_bam_prefix: output BAM filename
+    :param memory: job memory
+    :param ncpu: number of CPUs
+    :param storage: storage to use for the job
+    :param img: image to use for the job
+    :param tmp_dir: output directory to write temporary file to
+    :return: Job object
+    """
+    j = b.new_job(name=f'1.GetBamReadGroups: {output_bam_prefix}')
+
+    j.cpu(ncpu)
+    j.image(img)
+    j.memory(f'{memory}')
+    j.storage(f'{storage}Gi')
+    j.command(
+        f"""
+        samtools view -@{ncpu} -H {input_bam} | grep ^@RG > rgs_tmp.txt
+        """
+    )
+
+    # Get read group IDs only
+    j.command(f"""
+        awk -F'\t' '{{split($2, arr, ":"); print arr[2]}}' rgs_tmp.txt > {j.ofile}
+    """)
+
+    # write a file containing read group ID per line, so we can loop through it when mapping
+    b.write_output(j.ofile, f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt')
+
+    return j
+
+
 # https://gatk.broadinstitute.org/hc/en-us/articles/4403687183515--How-to-Generate-an-unmapped-BAM-from-FASTQ-or-aligned-BAM
-# 1. unmap reads
+# https://gatk.broadinstitute.org/hc/en-us/articles/360039568932--How-to-Map-and-clean-up-short-read-sequence-data-efficiently
+# 2. unmap reads
 def bam_to_ubam(
         b: hb.batch.Batch,
-        input_bam: hb.ResourceGroup,
+        input_bam: hb.ResourceFile,
         output_bam_prefix: str = None,
+        rg_ids: List[str] = None,
         disk_size: int = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: str = 'standard',
         ncpu: int = 8,
-        out_dir: str = None
+        tmp_dir: str = None
 ) -> Job:
     """
     Unmap reads
     :param b: batch
     :param input_bam: input BAM file to be unmapped
     :param output_bam_prefix: BAM filename without extension
+    :param rg_ids: list of unique read group IDs in the BAM file
     :param img: image to use for the job
     :param memory: job memory
     :param ncpu: number of CPUs
     :param disk_size: disk size to use for the job
-    :param out_dir: output directory to write files to
+    :param tmp_dir: output directory to write temporary file to
     :return: Job object
     """
-    j = b.new_job(name=f'1.BamToUbam: {output_bam_prefix}')
-
-    j.declare_resource_group(
-        output_bam={
-            'bam': '{root}.bam'
-        }
-    )
+    j = b.new_job(name=f'2.BamToUbam: {output_bam_prefix}')
 
     j.image(img)
     j.cpu(ncpu)
@@ -80,13 +134,15 @@ def bam_to_ubam(
 
     java_mem = ncpu * 4 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
 
+    # set --OUTPUT_BY_READGROUP to true, so we can map each group in parallel
     j.command(
         f"""
         cd /io
         mkdir tmp/
+        mkdir tmp/reverted/
         gatk --java-options -Xmx{java_mem}g RevertSam \
-            -I {input_bam['bam']} \
-            -O {j.output_bam['bam']} \
+            -I {input_bam} \
+            -O `pwd`/tmp/reverted \
             --SANITIZE true \
             --MAX_DISCARD_FRACTION 0.005 \
             --ATTRIBUTE_TO_CLEAR XT \
@@ -94,6 +150,7 @@ def bam_to_ubam(
             --ATTRIBUTE_TO_CLEAR AS \
             --ATTRIBUTE_TO_CLEAR OC \
             --ATTRIBUTE_TO_CLEAR OP \
+            --OUTPUT_BY_READGROUP true \
             --SORT_ORDER queryname \
             --RESTORE_ORIGINAL_QUALITIES true \
             --REMOVE_DUPLICATE_INFORMATION true \
@@ -102,50 +159,51 @@ def bam_to_ubam(
         """
     )
 
-    if out_dir:
-        b.write_output(j.output_bam,
-                       f'{out_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}.unmapped')
+    for rg_id in rg_ids:
+        j.command(f"cp tmp/reverted/{rg_id}.bam {j[f'{rg_id}']}")
+        b.write_output(j[f'{rg_id}'], f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg_id}.unmapped.bam')
 
     return j
 
 
-# 2. Map reads to reference (still to be tested/optimized)
+# 3. Map reads to reference (still to be tested/optimized)
 def sam_to_fastq_and_bwa_mem_and_mba(
         b: hb.batch.Batch,
-        input_bam: hb.ResourceFile,
+        input_bam: hb.resource.InputResourceFile,
         output_bam_prefix: str = None,
-        ref_genome: hb.ResourceGroup = None,
-        bwa_commandline: str = 'bwa mem -K 100000000 -p -v 3 -t 16 -Y $bash_ref_fasta',
+        fasta_reference: hb.ResourceGroup = None,
+        rg: str = None,
         compression_level: int = 2,
         disk_size: int = None,
         img: str = 'docker.io/lindonkambule/gatk-bwa:v1.0',
         memory: str = 'standard',
-        ncpu: int = 16,
-        out_dir: str = None
+        ncpu: int = 8,
+        tmp_dir: str = None
 ) -> Job:
     """
     Read unmapped BAM, convert to FASTQ and stream to BWA MEM for alignment, then stream to MergeBamAlignment
     :param b: batch
     :param input_bam: input uBAM file to be mapped
     :param output_bam_prefix: BAM filename without extension
-    :param ref_genome: reference genome files to be used in alignment
+    :param fasta_reference: reference genome files to be used in alignment
     :param compression_level: compression level
-    :param bwa_commandline: BWA command-line to be used ro map the BAM file
+    :param rg: read group ID
     :param img: image to use for the job
     :param memory: job memory
     :param ncpu: number of CPUs
     :param disk_size: disk size to use for the job
-    :param out_dir: output directory to write files to
+    :param tmp_dir: output directory to write temporary file to
     :return: Job object
     """
-    j = b.new_job(name=f'2.SamToFastqAndBwaMemAndMba: {output_bam_prefix}')
+    j = b.new_job(name=f'3.SamToFastqAndBwaMemAndMba-{output_bam_prefix}: {rg}')
 
     j.declare_resource_group(
         output_bam={
-            'bam': '{root}.bam',
-            'log': '{root}.bwa.stderr.log'
+            'bam': '{root}.bam'
         }
     )
+
+    # input_bam = b.read_input(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam')
 
     j.image(img)
     j.cpu(ncpu)
@@ -153,24 +211,22 @@ def sam_to_fastq_and_bwa_mem_and_mba(
     j.storage(f'{disk_size}Gi')
     java_mem = ncpu * 4 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
 
-    # not setting set -o pipefail here because /bwa has a rc=1 and we don't want to allow rc=1 to succeed because
-    # the sed may also fail with that error and that is something we actually want to fail on.
-    j.command(f"""bwa_version=$(bwa 2>&1 | grep -e '^Version' | sed 's/Version: //')""")
+    j.command(f"""
+        bwa_version=$(bwa 2>&1 | grep -e '^Version' | sed 's/Version: //')
+        bwa_commandline=$(echo bwa mem -K 100000000 -pt{ncpu} -v 3 -CH <(samtools view -H {input_bam}|grep ^@RG) -Y {fasta_reference['ref_fasta']})
+    """)
+
+    # https://lh3.github.io/2021/07/06/remapping-an-aligned-bam
     j.command(
         f"""
         set -o pipefail
         set -e
     
         # set the bash variable needed for the command-line
-        bash_ref_fasta={ref_genome['ref_fasta']}
         # if ref_alt has data in it,
-        if [ -s {ref_genome['ref_alt']} ]; then
-          gatk --java-options "-Xms5000m -Xmx8000m" SamToFastq \
-            --INPUT {input_bam} \
-            --FASTQ /dev/stdout \
-            --INTERLEAVE true \
-            --NON_PF true | \
-          {bwa_commandline} /dev/stdin - 2> >(tee {output_bam_prefix}.bwa.stderr.log >&2) | \
+        if [ -s {fasta_reference['ref_alt']} ]; then
+          samtools fastq -OT RG,BC {input_bam} |
+          bwa mem -K 100000000 -pt{ncpu} -v 3 -CH <(samtools view -H {input_bam}|grep ^@RG) -Y {fasta_reference['ref_fasta']} - | \
           gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms5000m -Xmx{java_mem}g" MergeBamAlignment \
             --VALIDATION_STRINGENCY SILENT \
             --EXPECTED_ORIENTATIONS FR \
@@ -180,7 +236,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
             --ALIGNED_BAM /dev/stdin \
             --UNMAPPED_BAM {input_bam} \
             --OUTPUT {j.output_bam['bam']} \
-            --REFERENCE_SEQUENCE {ref_genome['ref_fasta']} \
+            --REFERENCE_SEQUENCE {fasta_reference['ref_fasta']} \
             --PAIRED_RUN true \
             --SORT_ORDER "unsorted" \
             --IS_BISULFITE_SEQUENCE false \
@@ -192,15 +248,12 @@ def sam_to_fastq_and_bwa_mem_and_mba(
             --PRIMARY_ALIGNMENT_STRATEGY MostDistant \
             --PROGRAM_RECORD_ID "bwamem" \
             --PROGRAM_GROUP_VERSION "$bwa_version" \
-            --PROGRAM_GROUP_COMMAND_LINE "{bwa_commandline}" \
+            --PROGRAM_GROUP_COMMAND_LINE "$bwa_commandline" \
             --PROGRAM_GROUP_NAME "bwamem" \
             --UNMAPPED_READ_STRATEGY COPY_TO_TAG \
             --ALIGNER_PROPER_PAIR_FLAGS true \
             --UNMAP_CONTAMINANT_READS true \
             --ADD_PG_TAG_TO_READS false
-    
-          grep -m1 "read .* ALT contigs" {output_bam_prefix}.bwa.stderr.log | \
-          grep -v "read 0 ALT contigs"
     
         # else ref_alt is empty or could not be found
         else
@@ -209,40 +262,42 @@ def sam_to_fastq_and_bwa_mem_and_mba(
         """
     )
 
-    # This step is compute-heavy, we definitely want to write this file out. Make sure out_dir is specified
-    if out_dir:
-        b.write_output(j.output_bam,
-                       f'{out_dir}/gatk_vc/mapped_bams/{output_bam_prefix}.aligned.unsorted')
+    b.write_output(j.output_bam,
+                   f'{tmp_dir}/gatk_vc/mapped_bams/{output_bam_prefix}/{rg}.aligned.unsorted')
 
     return j
 
 
-# 3. Mark duplicate reads to avoid counting non-independent observations
+# 4. Mark duplicate reads to avoid counting non-independent observations
+# We take advantage of the tool's ability to take multiple BAM inputs and write out a single output
+# to avoid having to spend time just merging BAM files.
 def mark_duplicates(
         b: hb.batch.Batch,
-        input_bam: hb.ResourceGroup,
+        input_bams: List[hb.resource.InputResourceFile],
         output_bam_prefix: str = None,
+        use_preemptible_worker: bool = None,
         compression_level: int = 2,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: float = 8,
         ncpu: int = 2,
-        out_dir: str = None,
+        tmp_dir: str = None
 ) -> Job:
     """
     Mark duplicates
     :param b: batch
-    :param input_bam: input CRAM file
+    :param input_bams: list of input BAM files. The BAMs are from the same individual, just split by read group
     :param output_bam_prefix: BAM filename without extension
+    :param use_preemptible_worker: whether to use a preemptible worker
     :param compression_level: compression level
     :param img: image to use for the job
     :param memory: job memory
     :param ncpu: number of CPUs
     :param disk_size: disk size to use for the job
-    :param out_dir: output directory to write files to
+    :param tmp_dir: output directory to write files to
     :return: Job object
     """
-    j = b.new_job(name=f'3.MarkDuplicates: {output_bam_prefix}')
+    j = b.new_job(name=f'4.MarkDuplicates: {output_bam_prefix}')
 
     j.declare_resource_group(
         output_bam={
@@ -250,16 +305,19 @@ def mark_duplicates(
         }
     )
 
+    bams_rg = ' '.join([f"-I {f}" for f in input_bams])
+
     j.cpu(ncpu)
     j.image(img)
     j.memory(f'{memory}Gi')
+    j._preemptible = use_preemptible_worker
     j.storage(f'{disk_size}Gi')
     j.command(
         f"""
         cd /io
         mkdir tmp/
         gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms4000m" MarkDuplicates \
-            -I {input_bam['bam']} \
+            {bams_rg} \
             -O {j.output_bam['bam']} \
             -M {j.markdup_metrics} \
             --VALIDATION_STRINGENCY SILENT \
@@ -271,24 +329,25 @@ def mark_duplicates(
         """
     )
 
-    if out_dir:
-        b.write_output(j.output_bam,
-                       f'{out_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked')
+    b.write_output(j.output_bam,
+                   f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked')
+    b.write_output(j.markdup_metrics,
+                   f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.marked_dup_metrics.txt')
 
     return j
 
 
-# 4. SortSam
+# 5. SortSam
 def picard_sort_bam(
         b: hb.batch.Batch,
-        input_bam: Union[str, hb.ResourceGroup],
+        input_bam: hb.resource.InputResourceFile,
         output_bam_prefix: str = None,
         compression_level: int = 2,
         img: str = 'docker.io/broadinstitute/gatk:latest',
-        memory: float = 8,
-        ncpu: int = 2,
-        disk_size: int = None,
-        out_dir: str = None
+        memory: float = 5,
+        ncpu: int = 1,
+        disk_size: Union[float, int] = None,
+        tmp_dir: str = None
 ) -> Job:
     """
     Sort BAM file, using Picard, by coordinate order and fix tag values for NM and UQ (slower than samtools)
@@ -300,16 +359,15 @@ def picard_sort_bam(
     :param memory: job memory
     :param ncpu: number of CPUs
     :param disk_size: disk size to use for the job
-    :param out_dir: output directory to write files to
+    :param tmp_dir: output directory to write files to
     :return: Job object
     """
-    j = b.new_job(name=f'4.SortSam: {output_bam_prefix}')
+    j = b.new_job(name=f'5.SortSam: {output_bam_prefix}')
 
     j.declare_resource_group(
         output_bam={
             'bam': '{root}.bam',
-            'bam.bai': '{root}.bam.bai',
-            'bam.md5': '{root}.bam.md5',
+            'bam.bai': '{root}.bam.bai'
         }
     )
 
@@ -317,40 +375,49 @@ def picard_sort_bam(
     j.image(img)
     j.memory(f'{memory}Gi')
     j.storage(f'{disk_size}Gi')
+    # --CREATE_INDEX was not working, hence the indexing is a separate command
     j.command(
         f"""cd /io
         mkdir tmp/
         gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms5000m" SortSam \
-            -I {input_bam['bam']} \
+            -I {input_bam} \
             -O {j.output_bam['bam']} \
             -SO coordinate \
-            --CREATE_INDEX true \
-            --CREATE_MD5_FILE true \
             --MAX_RECORDS_IN_RAM 300000 \
             --TMP_DIR `pwd`/tmp
         """
     )
+    j.command(
+        f"""cd /io
+        gatk --java-options "-Xms5000m" BuildBamIndex \
+            -I {j.output_bam['bam']}\
+            -O {j.output_bam['bam.bai']} \
+            --TMP_DIR `pwd`/tmp
+        """
+    )
 
-    if out_dir:
+    j.command("ls")
+
+    if tmp_dir:
         b.write_output(j.output_bam,
-                       f'{out_dir}/gatk_vc/sorted_bams/{output_bam_prefix}.aligned.duplicate_marked.sorted')
+                       f'{tmp_dir}/gatk_vc/sorted_bams/{output_bam_prefix}.aligned.duplicate_marked.sorted')
 
     return j
 
 
-# 5. Check that the fingerprints of separate readgroups all match
+# 6. Check that the fingerprints of separate readgroups all match
 def cross_check_fingerprints(
         b: hb.batch.Batch,
         input_bam: hb.ResourceGroup,
         output_bam_prefix: str,
         haplotype_database_file: hb.ResourceGroup,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: str = 'standard',
         ncpu: int = 8,
         out_dir: str = None
 ) -> Job:
-    j = b.new_job(name=f'5.CrossCheckFingerprints: {output_bam_prefix}')
+    j = b.new_job(name=f'6.CrossCheckFingerprints: {output_bam_prefix}')
 
     j.cpu(ncpu)
     j.image(img)
@@ -360,7 +427,7 @@ def cross_check_fingerprints(
     j.command(
         f"""
         gatk --java-options "-Dsamjdk.buffer_size=131072 -XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -Xms2000m" \
-            CrosscheckReadGroupFingerprints \
+            CrosscheckFingerprints \
             --OUTPUT {output_bam_prefix}.crosscheck \
             --HAPLOTYPE_MAP {haplotype_database_file} \
             --EXPECT_ALL_READ_GROUPS_TO_MATCH true \
@@ -377,20 +444,19 @@ def cross_check_fingerprints(
     return j
 
 
-# 6. Check contamination
+# 7. Check contamination
 # We do not need to adjust the FREEMIX at this step since we'll use CHARR later
 def check_contamination(
         b: hb.batch.Batch,
         input_bam: hb.ResourceGroup,
         output_bam_prefix: str,
-        ref_genome: hb.ResourceGroup,
-        contamination_sites_ud: hb.ResourceFile,
-        contamination_sites_mu: hb.ResourceFile,
-        contamination_sites_bed: hb.ResourceFile,
-        disk_size: float = None,
+        fasta_reference: hb.ResourceGroup,
+        contamination_sites: hb.ResourceGroup,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/griffan/verifybamid2:latest',
         memory: int = 8,
-        ncpu: int = 8
+        ncpu: int = 8,
+        out_dir: str = None
 ) -> Job:
     j = b.new_job(name=f'7.CheckContamination: {output_bam_prefix}')
     j.declare_resource_group(
@@ -402,7 +468,7 @@ def check_contamination(
     j.image(img)
     j.memory(f'{memory}Gi')
     j.cpu(ncpu)
-    j.storage(f'{disk_size + 5}Gi')
+    j.storage(f'{disk_size}Gi')
 
     j.command(
         f"""
@@ -414,10 +480,10 @@ def check_contamination(
         --NumPC 4 \
         --Output {j.output} \
         --BamFile {input_bam['bam']} \
-        --Reference {ref_genome['ref_fasta']} \
-        --UDPath {contamination_sites_ud} \
-        --MeanPath {contamination_sites_mu} \
-        --BedPath {contamination_sites_bed}
+        --Reference {fasta_reference['ref_fasta']} \
+        --UDPath {contamination_sites['ud']} \
+        --MeanPath {contamination_sites['mu']} \
+        --BedPath {contamination_sites['bed']}
         """
     )
 
@@ -443,7 +509,9 @@ def check_contamination(
         """
     )
 
-    # use FREEMIX=$(tail -n +2 {j.output['selfSM']} | awk '{{print $7}}') to extract freemix estimate downstream
+    # use FREEMIX=$(tail -n +2 {j.output['selfSM']} | awk '{{print $7}}') to extract freemix estimate downstream (HC)
+    b.write_output(j.output,
+                   f'{out_dir}/gatk_vc/VerifyBamID/{output_bam_prefix}')
 
     return j
 
@@ -519,58 +587,15 @@ with open("sequence_grouping_with_unmapped.txt", "w") as tsv_file_with_unmapped:
     return j
 
 
-# 7. IntervalListTools
-# Perform variant calling on the sub-intervals, and then gather the results
-def split_interval_list(
-        b: hb.Batch = None,
-        img: str = 'docker.io/broadinstitute/gatk:latest',
-        utils: Dict = None,
-) -> Job:
-    """
-    Break the calling interval_list into sub-intervals
-    :param b: Batch object to add jobs to
-    :param img: image to use for the job
-    :param utils: a dictionary containing resources (file paths and arguments) to be used to split genome
-    :return: a Job object with a single output j.intervals of type ResourceGroup
-    """
-    j = b.new_job(f"""7.Make {utils['haplotype_scatter_count']} intervals""")
-    j.image(img)
-    j.memory('standard')
-    j.storage('1G')
-
-    j.command(
-        f"""set -e
-        mkdir /scatter_intervals
-        gatk --java-options "-Xms1g" IntervalListTools \
-        --SCATTER_COUNT {utils['haplotype_scatter_count']} \
-        --SUBDIVISION_MODE BALANCING_WITHOUT_INTERVAL_SUBDIVISION_WITH_OVERFLOW \
-        --UNIQUE true \
-        --SORT true \
-        --BREAK_BANDS_AT_MULTIPLES_OF {utils['break_bands_at_multiples_of']} \
-        -I {utils['wgs_calling_interval_list']} \
-        -O /scatter_intervals
-      """
-    )
-
-    # e.g if scatter_count = 50, /scatter_intervals will have temp_0001_of_50, temp_0002_of_50, ..., temp_0050_of_50
-    # file names under /scatter_intervals/temp_00_of_ are not numbered, it's just scattered.interval_list
-    # use .interval_list for Picard-style interval OR .list or .intervals for GATK-style
-    # https://gatk.broadinstitute.org/hc/en-us/articles/360035531852-Intervals-and-interval-lists
-    for idx in range(utils['haplotype_scatter_count']):
-        j.command(f"cp /scatter_intervals/temp_{str(idx + 1).zfill(4)}_of_{utils['haplotype_scatter_count']}/scattered.interval_list {j[f'interval_{idx}.interval_list']}")
-
-    return j
-
-
 # 8. BaseRecalibrator
 def base_recalibrator(
         b: hb.batch.Batch,
         input_bam: hb.ResourceGroup,
         fasta_reference: hb.ResourceGroup,
         output_bam_prefix: str = None,
-        sequence_group_interval: List[bytes] = None,
+        sequence_group_interval: Union[List[bytes], str] = None,
         utils: Dict = None,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: float = 6,
         ncpu: int = 2
@@ -599,11 +624,10 @@ def base_recalibrator(
     known_indel_sites = ' '.join([f'--known-sites {file}' for file in utils['known_indels_sites_VCFs']])
     sequence_group_interval_cmd = ' '.join([f'-L {interval}' for interval in sequence_group_interval])
 
+    # PrintGCTimeStamps and similar flags has been removed from java
     j.command(
         f"""
-        gatk --java-options "-XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -XX:+PrintFlagsFinal \
-            -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps -XX:+PrintGCDetails \
-            -Xloggc:gc_log.log -Xms4000m" BaseRecalibrator \
+        gatk --java-options "-XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -Xms4000m" BaseRecalibrator \
             -R {fasta_reference['ref_fasta']} \
             -I {input_bam['bam']} \
             --use-original-qualities \
@@ -618,11 +642,11 @@ def base_recalibrator(
 
 
 # 9. GatherBQSRReports
-def gather_tranches(
+def gather_bqsr_reports(
         b: hb.Batch,
         input_bqsr_reports: List[hb.ResourceFile],
         output_bam_prefix: str = None,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: int = 3500,
         ncpu: int = 1
@@ -663,9 +687,9 @@ def apply_bqsr(
         fasta_reference: hb.ResourceGroup,
         output_bam_prefix: str = None,
         bsqr_report: hb.ResourceFile = None,
-        sequence_group_interval: str = None,
+        sequence_group_interval: Union[List[bytes], str] = None,
         compression_level: int = 2,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: int = 3500,
         ncpu: int = 2
@@ -702,11 +726,11 @@ def apply_bqsr(
 
     sequence_group_interval_cmd = ' '.join([f'-L {interval}' for interval in sequence_group_interval])
 
+    # PrintGCTimeStamps and similar flags has been removed from java
+    # "-XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -Xms4000m" BaseRecalibrator
     j.command(
         f"""
-        gatk --java-options "-XX:+PrintFlagsFinal -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps \
-            -XX:+PrintGCDetails -Xloggc:gc_log.log \
-            -XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -Dsamjdk.compression_level=${compression_level} -Xms3000m" \
+        gatk --java-options "-XX:GCTimeLimit=50 -XX:GCHeapFreeLimit=10 -Dsamjdk.compression_level={compression_level} -Xms3000m" \
             ApplyBQSR \
             --create-output-bam-md5 \
             --add-output-sam-program-record \
@@ -733,8 +757,8 @@ def gather_bam_files(
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: float = 3,
         ncpu: int = 8,
-        disk_size: int = None,
-        out_dir: str = None
+        disk_size: Union[float, int] = None,
+        tmp_dir: str = None
 ) -> Job:
     """
     Merge the recalibrated BAM files resulting from by-interval recalibration
@@ -746,7 +770,7 @@ def gather_bam_files(
     :param img: image to use for the job
     :param memory: job memory
     :param ncpu: number of CPUs
-    :param out_dir: output directory
+    :param tmp_dir: temporary directory
     :return: Job object
     """
     input_cmdl = ' '.join([f'--INPUT {b["bam"]}' for b in input_bams])
@@ -756,8 +780,8 @@ def gather_bam_files(
     j.declare_resource_group(
         gathered_bams={
             'bam': '{root}.bam',
-            'index': '{root}.bai',
-            'md5': '{root}.bam.md5'
+            'bam.bai': '{root}.bai',
+            'bam.md5': '{root}.bam.md5'
         }
     )
 
@@ -775,9 +799,8 @@ def gather_bam_files(
         """
     )
 
-    if out_dir:
-        b.write_output(j.gathered_bams,
-                       f'{out_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr')
+    b.write_output(j.gathered_bams,
+                   f'{tmp_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr')
 
     return j
 
@@ -791,7 +814,7 @@ def convert_to_cram(
         output_bam_prefix: str = None,
         memory: int = 3,
         ncpu: int = 4,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         out_dir: str = None
 ) -> Job:
@@ -824,7 +847,7 @@ def convert_to_cram(
     j.storage(f'{disk_size}Gi')
     j.command(
         f"""        
-        samtools view -@ {ncpu} -C -T {fasta_reference['ref_fasta']} {input_bam['bam']} | \
+        samtools view -@{ncpu} -C -T {fasta_reference['ref_fasta']} {input_bam['bam']} | \
             tee {j.output_cram['cram']} | \
             md5sum | awk '{{print $1}}' > {j.output_cram['md5']}
         
@@ -838,8 +861,7 @@ def convert_to_cram(
     )
 
     # DEFINITELY write this out to a bucket
-    if out_dir:
-        b.write_output(j.output_cram, f'{out_dir}/gatk_vc/crams/{output_bam_prefix}')
+    b.write_output(j.output_cram, f'{out_dir}/gatk_vc/crams/{output_bam_prefix}')
 
     return j
 
@@ -852,9 +874,9 @@ def collect_aggregation_metrics(
         input_bam: hb.ResourceGroup,
         fasta_reference: hb.ResourceGroup = None,
         output_bam_prefix: str = None,
-        memory: int = 7,
-        ncpu: int = 4,
-        disk_size: int = None,
+        memory: int = 8,
+        ncpu: int = 1,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest'
 ) -> Job:
 
@@ -870,11 +892,11 @@ def collect_aggregation_metrics(
     j.image(img)
     j.memory(f'{memory}Gi')
     j.storage(f'{disk_size}Gi')
-    java_mem = int((ncpu * memory) * 0.5)    # set max heap space to only up one-half of available mem
+    # java_mem = int((ncpu * memory) * 0.5)
 
     j.command(
         f"""
-        gatk --java-options "-Xms5000m -Xmx{java_mem}g" CollectMultipleMetrics \
+        gatk --java-options "-Xms5000m" CollectMultipleMetrics \
             -I {input_bam['bam']} \
             -R {fasta_reference['ref_fasta']} \
             --OUTPUT {j.output} \
@@ -893,11 +915,12 @@ def collect_aggregation_metrics(
 def check_pre_validation(
         b: hb.Batch = None,
         output_bam_prefix: str = None,
-        duplication_metrics: hb.ResourceFile = None,
+        duplication_metrics: hb.resource.InputResourceFile = None,
         chimerism_metrics: hb.ResourceFile = None,
         max_duplication_in_reasonable_sample: float = 0.30,
         max_chimerism_in_reasonable_sample: float = 0.15,
         img: str = 'docker.io/hailgenetics/python-dill:3.9-slim',
+        tmp_dir: str = None
 ) -> Job:
     """
     Check whether the data has massively high duplication or chimerism rates
@@ -908,6 +931,7 @@ def check_pre_validation(
     :param max_duplication_in_reasonable_sample: max reasonable duplication for a sample
     :param max_chimerism_in_reasonable_sample: max reasonable chimerism for a sample
     :param img: image to use for the job
+    :param tmp_dir: output directory to write files to
     :return: a Job object with a single output j.intervals of type ResourceGroup
     """
     j = b.new_job(f'14.CheckPreValidation: {output_bam_prefix}')
@@ -958,8 +982,11 @@ with open("chimerism.csv") as chimfile:
 
     j.command(
         f"""
-        cp is_outlier_data.txt {j['is_outlier_data']}
+        cp is_outlier_data.txt {j.is_outlier_data}
     """)
+
+    b.write_output(j.is_outlier_data,
+                   f'{tmp_dir}/gatk_vc/check_pre_validation/{output_bam_prefix}.is.outlier.txt')
 
     return j
 
@@ -972,16 +999,16 @@ def validate_samfile(
         ignore: List[str] = ["MISSING_TAG_NM"],
         output_bam_prefix: str = None,
         max_output: int = 1000000000,
-        is_outlier_data: hb.ResourceFile = None,
-        disk_size: int = None,
+        is_outlier_data: hb.resource.InputResourceFile = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: int = 3500,
         ncpu: int = 2
 ) -> Job:
     """
-    Apply Base Quality Score Recalibration (BQSR) model
+    Validate the CRAM file
     :param b: batch
-    :param input_bam: input BAM file
+    :param input_bam: input CRAM file
     :param fasta_reference: reference files. dict, fast, and fasta index required
     :param ignore: list of validation error types to ignore
     :param output_bam_prefix: BAM filename without extension
@@ -1008,7 +1035,7 @@ def validate_samfile(
         is_outlier=$(awk '{{print $1}}' {is_outlier_data})
         
         gatk --java-options "-Xms6000m" ValidateSamFile \
-            -I {input_bam['bam']} \
+            -I {input_bam['cram']} \
             -O {j.report} \
             -R {fasta_reference['ref_fasta']} \
             --MAX_OUTPUT {max_output} \
@@ -1020,3 +1047,315 @@ def validate_samfile(
     )
 
     return j
+
+
+# Run a single BAM file through the entire processing workflow
+def pre_process_bam(
+        b: hb.Batch,
+        input_bam: hb.ResourceFile,
+        output_bam_prefix: str = None,
+        unmapped_bam_size: Union[float, int] = None,
+        fasta_reference: hb.ResourceGroup = None,
+        bwa_reference_files: hb.ResourceGroup = None,
+        haplotype_database_file: hb.ResourceGroup = None,
+        contamination_sites: hb.ResourceGroup = None,
+        ref_size: Union[float, int] = None,
+        bwa_ref_size: Union[float, int] = None,
+        bwa_disk_multiplier: float = 2.5,
+        additional_disk: float = 20.0,
+        md_disk_multiplier: float = 2.25,
+        sort_sam_disk_multiplier: float = 3.25,
+        out_dir: str = None,
+        tmp_dir: str = None,
+        utils: Dict = None
+):
+    """
+    Process one BAM file
+    :param b: Batch object to add jobs to
+    :param input_bam: input BAM to be processed
+    :param output_bam_prefix: prefix that will be used when writing out files
+    :param unmapped_bam_size: size of the unmapped BAM file
+    :param fasta_reference: reference files. dict, fast, and fasta index required
+    :param bwa_reference_files: reference files required by BWA
+    :param haplotype_database_file: haplotype database file
+    :param contamination_sites: ResourceGroup of the contamination sites files
+    :param ref_size: size of reference files (fasta, index, dict)
+    :param bwa_ref_size: size of BWA reference files
+    :param bwa_disk_multiplier: full path to transmitted singletons VCF file and its index
+    :param additional_disk: full path to sibling singletons VCF file and its index
+    :param md_disk_multiplier: full path to transmitted singletons VCF file and its index
+    :param sort_sam_disk_multiplier: full path to sibling singletons VCF file and its index
+    :param out_dir: directory to write final output files to
+    :param tmp_dir: directory to write intermediate files to
+    :param utils: dictionary containing paths to public resources and commonly used
+    :return: a final Job, and a path to the VCF with VQSR annotations
+    """
+    get_read_groups(
+        b=b,
+        input_bam=input_bam,
+        output_bam_prefix=output_bam_prefix,
+        storage=unmapped_bam_size,
+        tmp_dir=tmp_dir
+    )
+    b.run()
+
+    bam_rg_ids = hfs.open(f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt').readlines()
+    rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
+
+    # unmap BAM to multiple uBAM files split by read group
+    bam_to_ubam(
+        b=b,
+        input_bam=input_bam,
+        output_bam_prefix=output_bam_prefix,
+        rg_ids=rgs,
+        disk_size=unmapped_bam_size*2,
+        tmp_dir=tmp_dir
+    )
+    b.run()     # call this, so we can be able to get file sizes of readgroup BAM files
+
+    # map uBAM files in parallel
+    # b.run() doesn't allow reading files from a job executed by one b.run() in a job executed by a different b.run()
+    unmapped_bams = [b.read_input(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam') for
+                     rg in rgs]
+    unmapped_bam_sizes = [size(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
+
+    bams_rg_mapped = [
+        sam_to_fastq_and_bwa_mem_and_mba(
+            b=b,
+            input_bam=bam,
+            output_bam_prefix=output_bam_prefix,
+            rg=rg,
+            fasta_reference=bwa_reference_files,
+            disk_size=round(unmapped_bam_size+bwa_ref_size + (bwa_disk_multiplier*unmapped_bam_size) + additional_disk),
+            tmp_dir=tmp_dir
+        ).output_bam
+        for bam, rg, unmapped_bam_size in zip(unmapped_bams, rgs, unmapped_bam_sizes)
+    ]
+    b.run()
+
+    # Sum the read group bam sizes to approximate the aggregated bam size
+    mapped_bam_total_size = sum([size(f'{tmp_dir}/gatk_vc/mapped_bams/{output_bam_prefix}/{rg}.aligned.unsorted.bam')
+                                 for rg in rgs])
+    bams_rg_mapped = [b.read_input(f'{tmp_dir}/gatk_vc/mapped_bams/{output_bam_prefix}/{rg}.aligned.unsorted.bam') for
+                      rg in rgs]
+
+    # MarkDuplicates and SortSam currently take too long for preemptibles if the input data is too large
+    use_preemptible = not mapped_bam_total_size > 110.0
+
+    mark_duplicates(
+        b=b,
+        input_bams=bams_rg_mapped,
+        output_bam_prefix=output_bam_prefix,
+        use_preemptible_worker=use_preemptible,
+        disk_size=(md_disk_multiplier * mapped_bam_total_size) + additional_disk,
+        tmp_dir=tmp_dir
+    )
+    b.run()
+
+    bam_md = b.read_input(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked.bam')
+    agg_bam_size = size(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked.bam')
+
+    sort_sam_bam = picard_sort_bam(
+        b=b,
+        input_bam=bam_md,
+        output_bam_prefix=output_bam_prefix,
+        disk_size=(sort_sam_disk_multiplier * agg_bam_size) + additional_disk
+    ).output_bam
+
+    # CrosscheckFingerprints requires a haplotype map file
+    if haplotype_database_file:
+        ccf_j = cross_check_fingerprints(b=b,
+                                         input_bam=sort_sam_bam,
+                                         haplotype_database_file=haplotype_database_file,
+                                         output_bam_prefix=output_bam_prefix,
+                                         disk_size=agg_bam_size + additional_disk,
+                                         )
+
+    check_contamination(
+        b=b,
+        input_bam=sort_sam_bam,
+        output_bam_prefix=f'{output_bam_prefix}.preBqsr',
+        fasta_reference=fasta_reference,
+        contamination_sites=contamination_sites,
+        disk_size=agg_bam_size + ref_size + additional_disk,
+        out_dir=out_dir
+    )
+
+    seq_grouping = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping.txt').readlines()
+    seq_grouping_subgroup = [l.split('\t') for l in seq_grouping]
+    potential_bqsr_divisor = len(seq_grouping_subgroup) - 10
+    bqsr_divisor = potential_bqsr_divisor if potential_bqsr_divisor > 1 else 1
+
+    bqsr_reports = [
+        base_recalibrator(
+            b=b,
+            input_bam=sort_sam_bam,
+            fasta_reference=fasta_reference,
+            output_bam_prefix=output_bam_prefix,
+            sequence_group_interval=subgroup,
+            utils=utils,
+            disk_size=agg_bam_size + ref_size + additional_disk
+        ).recalibration_report
+        for subgroup in seq_grouping_subgroup
+    ]
+
+    gathered_bqsr_report = gather_bqsr_reports(
+        b=b,
+        input_bqsr_reports=[report for report in bqsr_reports],
+        output_bam_prefix=output_bam_prefix,
+        disk_size=additional_disk
+    ).output_bqsr_report
+
+    seq_grouping_with_unmapped = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping_with_unmapped.txt').readlines()
+    seq_grouping_with_unmapped_subgroup = [l.split('\t') for l in seq_grouping_with_unmapped]
+
+    # Apply the recalibration model by interval
+    recalibrated_bams = [
+        apply_bqsr(
+            b=b,
+            input_bam=sort_sam_bam,
+            fasta_reference=fasta_reference,
+            output_bam_prefix=output_bam_prefix,
+            bsqr_report=gathered_bqsr_report,
+            sequence_group_interval=subgroup,
+            disk_size=agg_bam_size + (agg_bam_size / bqsr_divisor) + ref_size + additional_disk
+        ).output_bam
+        for subgroup in seq_grouping_with_unmapped_subgroup
+    ]
+
+    # Merge the recalibrated BAM files resulting from by-interval recalibration
+    gather_bam_files(
+        b=b,
+        input_bams=recalibrated_bams,
+        output_bam_prefix=output_bam_prefix,
+        disk_size=(2 * agg_bam_size) + additional_disk,
+        tmp_dir=tmp_dir
+    )
+
+    b.run()     # BQSR bins the qualities which makes a significantly smaller bam. Get binned file size
+
+    gathered_bams_path = f'{tmp_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr'
+    gathered_bams = b.read_input_group(**{'bam': f'{gathered_bams_path}.bam',
+                                       'bam.bai': f'{gathered_bams_path}.bam.bai'})
+    binned_qual_bam_size = size(f'{gathered_bams_path}.bam')
+
+    # QC the final BAM some more (no such thing as too much QC)
+    agg_metrics = collect_aggregation_metrics(
+        b=b,
+        input_bam=gathered_bams,
+        fasta_reference=fasta_reference,
+        output_bam_prefix=output_bam_prefix,
+        disk_size=binned_qual_bam_size + ref_size + additional_disk
+    ).output
+
+    mark_dup_metrics = b.read_input(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.marked_dup_metrics.txt')
+    check_pre_validation(
+        b=b,
+        output_bam_prefix=output_bam_prefix,
+        duplication_metrics=mark_dup_metrics,
+        chimerism_metrics=agg_metrics['alignment_summary_metrics'],
+        tmp_dir=tmp_dir
+    )
+
+    # Convert the final merged recalibrated BAM file to CRAM format
+    convert_to_cram(
+        b=b,
+        input_bam=gathered_bams,
+        fasta_reference=fasta_reference,
+        output_bam_prefix=output_bam_prefix,
+        disk_size=(2 * binned_qual_bam_size) + ref_size + additional_disk,
+        out_dir=out_dir
+    )
+    b.run()
+
+    # Validate the CRAM file
+    cram_file = b.read_input_group(**{'cram': f'{out_dir}/gatk_vc/crams/{output_bam_prefix}.cram',
+                                      'cram.crai': f'{out_dir}/gatk_vc/crams/{output_bam_prefix}.cram.crai'})
+    cram_size = size(f'{out_dir}/gatk_vc/crams/{output_bam_prefix}.cram')
+
+    pre_val_metric = b.read_input(f'{tmp_dir}/gatk_vc/check_pre_validation/{output_bam_prefix}.is.outlier.txt')
+
+    validate_samfile(
+        b=b,
+        input_bam=cram_file,
+        fasta_reference=fasta_reference,
+        output_bam_prefix=output_bam_prefix,
+        is_outlier_data=pre_val_metric,
+        disk_size=cram_size + ref_size + additional_disk
+    )
+    b.run()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input-files', type=str, required=True)
+    parser.add_argument('--out-dir', type=str, required=True)
+    parser.add_argument('--tmp-dir', type=str, required=True)
+    parser.add_argument('--billing-project', type=str, required=True)
+
+    args = parser.parse_args()
+
+    backend = hb.ServiceBackend(
+        billing_project=args.billing_project,
+        regions=['us-central1'],
+        remote_tmpdir=args.tmp_dir,
+    )
+
+    batch = hb.Batch(
+        'BAM-Processing',
+        backend=backend,
+    )
+
+    ref_fasta = batch.read_input_group(**{'ref_fasta': inputs['ref_fasta'],
+                                          'ref_fasta_index': inputs['ref_fasta_index'],
+                                          'ref_dict': inputs['ref_dict']})
+
+    # BWA requires additional reference file
+    ref_fasta_bwa = batch.read_input_group(**{'ref_fasta': inputs['ref_fasta'],
+                                              'ref_fasta_index': inputs['ref_fasta_index'],
+                                              'ref_dict': inputs['ref_dict'],
+                                              'ref_alt': inputs['ref_alt'],
+                                              'ref_sa': inputs['ref_sa'],
+                                              'ref_amb': inputs['ref_amb'],
+                                              'ref_bwt': inputs['ref_bwt'],
+                                              'ref_ann': inputs['ref_ann'],
+                                              'ref_pac': inputs['ref_pac']})
+
+    contamination_sites = batch.read_input_group(**{'ud': inputs['contamination_sites_ud'],
+                                                    'mu': inputs['contamination_sites_mu'],
+                                                    'bed': inputs['contamination_sites_bed']})
+
+    # Get the size of the standard reference files as well as the additional reference files needed for BWA
+    ref_size = size(inputs['ref_fasta']) + size(inputs['ref_fasta_index']) + size(inputs['ref_dict'])
+    bwa_ref_size = ref_size + size(inputs['ref_alt']) + size(inputs['ref_amb']) + size(inputs['ref_ann']) + size(inputs['ref_bwt']) + size(inputs['ref_pac']) + size(inputs['ref_sa'])
+
+    bams = hfs.open(args.input_files).readlines()
+    bam_paths = [l.strip() for l in bams]
+
+    for bam in bam_paths:
+        bam_filename = os.path.basename(bam)
+        bam_prefix = os.path.splitext(bam_filename)[0]
+
+        bam_file = batch.read_input(bam)
+        bam_size = size(bam)
+
+        pre_process_bam(
+            b=batch,
+            input_bam=bam_file,
+            output_bam_prefix=bam_prefix,
+            unmapped_bam_size=bam_size,
+            fasta_reference=ref_fasta,
+            bwa_reference_files=ref_fasta_bwa,
+            contamination_sites=contamination_sites,
+            ref_size=ref_size,
+            bwa_ref_size=bwa_ref_size,
+            out_dir=args.out_dir,
+            tmp_dir=args.tmp_dir,
+            utils=inputs
+        )
+
+    # batch.run()
+
+
+if __name__ == '__main__':
+    main()

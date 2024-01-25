@@ -106,7 +106,7 @@ def bam_to_ubam(
         input_bam: hb.ResourceFile,
         output_bam_prefix: str = None,
         rg_ids: List[str] = None,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
         memory: str = 'standard',
         ncpu: int = 8,
@@ -174,7 +174,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
         fasta_reference: hb.ResourceGroup = None,
         rg: str = None,
         compression_level: int = 2,
-        disk_size: int = None,
+        disk_size: Union[float, int] = None,
         img: str = 'docker.io/lindonkambule/gatk-bwa:v1.0',
         memory: str = 'standard',
         ncpu: int = 8,
@@ -1108,7 +1108,7 @@ def pre_process_bam(
         input_bam=input_bam,
         output_bam_prefix=output_bam_prefix,
         rg_ids=rgs,
-        disk_size=unmapped_bam_size*2,
+        disk_size=round(unmapped_bam_size + unmapped_bam_size*2.5 + 10),
         tmp_dir=tmp_dir
     )
     b.run()     # call this, so we can be able to get file sizes of readgroup BAM files

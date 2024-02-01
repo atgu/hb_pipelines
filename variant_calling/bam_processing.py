@@ -1090,28 +1090,33 @@ def pre_process_bam(
     :param utils: dictionary containing paths to public resources and commonly used
     :return: a final Job, and a path to the VCF with VQSR annotations
     """
-    get_read_groups(
-        b=b,
-        input_bam=input_bam,
-        output_bam_prefix=output_bam_prefix,
-        storage=unmapped_bam_size,
-        tmp_dir=tmp_dir
-    )
-    b.run()
+    if not hfs.exists(f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt'):
+        get_read_groups(
+            b=b,
+            input_bam=input_bam,
+            output_bam_prefix=output_bam_prefix,
+            storage=unmapped_bam_size,
+            tmp_dir=tmp_dir
+        )
+        b.run()
 
     bam_rg_ids = hfs.open(f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt').readlines()
     rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
 
-    # unmap BAM to multiple uBAM files split by read group
-    bam_to_ubam(
-        b=b,
-        input_bam=input_bam,
-        output_bam_prefix=output_bam_prefix,
-        rg_ids=rgs,
-        disk_size=round(unmapped_bam_size + unmapped_bam_size*2.5 + 10),
-        tmp_dir=tmp_dir
-    )
-    b.run()     # call this, so we can be able to get file sizes of readgroup BAM files
+    # first check if unmapped BAMs exist
+    ubam_exists = [hfs.exists(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
+
+    if not all(ubam_exists):
+        # unmap BAM to multiple uBAM files split by read group
+        bam_to_ubam(
+            b=b,
+            input_bam=input_bam,
+            output_bam_prefix=output_bam_prefix,
+            rg_ids=rgs,
+            disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
+            tmp_dir=tmp_dir
+        )
+        b.run()     # call this, so we can be able to get file sizes of readgroup BAM files
 
     # map uBAM files in parallel
     # b.run() doesn't allow reading files from a job executed by one b.run() in a job executed by a different b.run()
@@ -1119,19 +1124,26 @@ def pre_process_bam(
                      rg in rgs]
     unmapped_bam_sizes = [size(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
 
-    bams_rg_mapped = [
-        sam_to_fastq_and_bwa_mem_and_mba(
-            b=b,
-            input_bam=bam,
-            output_bam_prefix=output_bam_prefix,
-            rg=rg,
-            fasta_reference=bwa_reference_files,
-            disk_size=round(unmapped_bam_size+bwa_ref_size + (bwa_disk_multiplier*unmapped_bam_size) + additional_disk),
-            tmp_dir=tmp_dir
-        ).output_bam
-        for bam, rg, unmapped_bam_size in zip(unmapped_bams, rgs, unmapped_bam_sizes)
-    ]
-    b.run()
+    bams_exists = [hfs.exists(f'{tmp_dir}/gatk_vc/mapped_bams/{output_bam_prefix}/{rg}.aligned.unsorted.bam') for
+                   rg in rgs]
+
+    if not all(bams_exists):
+        # list of BAM files that do not exist
+        not_mapped = [(unmapped_bams[i], rgs[i], unmapped_bam_sizes[i]) for i, val in enumerate(bams_exists) if not val]
+
+        bams_rg_mapped = [
+            sam_to_fastq_and_bwa_mem_and_mba(
+                b=b,
+                input_bam=bam,
+                output_bam_prefix=output_bam_prefix,
+                rg=rg,
+                fasta_reference=bwa_reference_files,
+                disk_size=round(unmapped_bam_size+bwa_ref_size + (bwa_disk_multiplier*unmapped_bam_size) + additional_disk),
+                tmp_dir=tmp_dir
+            ).output_bam
+            for bam, rg, unmapped_bam_size in not_mapped
+        ]
+        b.run()
 
     # Sum the read group bam sizes to approximate the aggregated bam size
     mapped_bam_total_size = sum([size(f'{tmp_dir}/gatk_vc/mapped_bams/{output_bam_prefix}/{rg}.aligned.unsorted.bam')
@@ -1142,15 +1154,16 @@ def pre_process_bam(
     # MarkDuplicates and SortSam currently take too long for preemptibles if the input data is too large
     use_preemptible = not mapped_bam_total_size > 110.0
 
-    mark_duplicates(
-        b=b,
-        input_bams=bams_rg_mapped,
-        output_bam_prefix=output_bam_prefix,
-        use_preemptible_worker=use_preemptible,
-        disk_size=(md_disk_multiplier * mapped_bam_total_size) + additional_disk,
-        tmp_dir=tmp_dir
-    )
-    b.run()
+    if not hfs.exists(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked.bam'):
+        mark_duplicates(
+            b=b,
+            input_bams=bams_rg_mapped,
+            output_bam_prefix=output_bam_prefix,
+            use_preemptible_worker=use_preemptible,
+            disk_size=(md_disk_multiplier * mapped_bam_total_size) + additional_disk,
+            tmp_dir=tmp_dir
+        )
+        b.run()
 
     bam_md = b.read_input(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked.bam')
     agg_bam_size = size(f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked.bam')
@@ -1181,58 +1194,59 @@ def pre_process_bam(
         out_dir=out_dir
     )
 
-    seq_grouping = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping.txt').readlines()
-    seq_grouping_subgroup = [l.split('\t') for l in seq_grouping]
-    potential_bqsr_divisor = len(seq_grouping_subgroup) - 10
-    bqsr_divisor = potential_bqsr_divisor if potential_bqsr_divisor > 1 else 1
+    if not hfs.exists(f'{tmp_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr.bam'):
+        seq_grouping = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping.txt').readlines()
+        seq_grouping_subgroup = [l.split('\t') for l in seq_grouping]
+        potential_bqsr_divisor = len(seq_grouping_subgroup) - 10
+        bqsr_divisor = potential_bqsr_divisor if potential_bqsr_divisor > 1 else 1
 
-    bqsr_reports = [
-        base_recalibrator(
+        bqsr_reports = [
+            base_recalibrator(
+                b=b,
+                input_bam=sort_sam_bam,
+                fasta_reference=fasta_reference,
+                output_bam_prefix=output_bam_prefix,
+                sequence_group_interval=subgroup,
+                utils=utils,
+                disk_size=agg_bam_size + ref_size + additional_disk
+            ).recalibration_report
+            for subgroup in seq_grouping_subgroup
+        ]
+
+        gathered_bqsr_report = gather_bqsr_reports(
             b=b,
-            input_bam=sort_sam_bam,
-            fasta_reference=fasta_reference,
+            input_bqsr_reports=[report for report in bqsr_reports],
             output_bam_prefix=output_bam_prefix,
-            sequence_group_interval=subgroup,
-            utils=utils,
-            disk_size=agg_bam_size + ref_size + additional_disk
-        ).recalibration_report
-        for subgroup in seq_grouping_subgroup
-    ]
+            disk_size=5
+        ).output_bqsr_report
 
-    gathered_bqsr_report = gather_bqsr_reports(
-        b=b,
-        input_bqsr_reports=[report for report in bqsr_reports],
-        output_bam_prefix=output_bam_prefix,
-        disk_size=additional_disk
-    ).output_bqsr_report
+        seq_grouping_with_unmapped = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping_with_unmapped.txt').readlines()
+        seq_grouping_with_unmapped_subgroup = [l.split('\t') for l in seq_grouping_with_unmapped]
 
-    seq_grouping_with_unmapped = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping_with_unmapped.txt').readlines()
-    seq_grouping_with_unmapped_subgroup = [l.split('\t') for l in seq_grouping_with_unmapped]
+        # Apply the recalibration model by interval
+        recalibrated_bams = [
+            apply_bqsr(
+                b=b,
+                input_bam=sort_sam_bam,
+                fasta_reference=fasta_reference,
+                output_bam_prefix=output_bam_prefix,
+                bsqr_report=gathered_bqsr_report,
+                sequence_group_interval=subgroup,
+                disk_size=agg_bam_size + (agg_bam_size / bqsr_divisor) + ref_size + additional_disk
+            ).output_bam
+            for subgroup in seq_grouping_with_unmapped_subgroup
+        ]
 
-    # Apply the recalibration model by interval
-    recalibrated_bams = [
-        apply_bqsr(
+        # Merge the recalibrated BAM files resulting from by-interval recalibration
+        gather_bam_files(
             b=b,
-            input_bam=sort_sam_bam,
-            fasta_reference=fasta_reference,
+            input_bams=recalibrated_bams,
             output_bam_prefix=output_bam_prefix,
-            bsqr_report=gathered_bqsr_report,
-            sequence_group_interval=subgroup,
-            disk_size=agg_bam_size + (agg_bam_size / bqsr_divisor) + ref_size + additional_disk
-        ).output_bam
-        for subgroup in seq_grouping_with_unmapped_subgroup
-    ]
+            disk_size=(2 * agg_bam_size) + additional_disk,
+            tmp_dir=tmp_dir
+        )
 
-    # Merge the recalibrated BAM files resulting from by-interval recalibration
-    gather_bam_files(
-        b=b,
-        input_bams=recalibrated_bams,
-        output_bam_prefix=output_bam_prefix,
-        disk_size=(2 * agg_bam_size) + additional_disk,
-        tmp_dir=tmp_dir
-    )
-
-    b.run()     # BQSR bins the qualities which makes a significantly smaller bam. Get binned file size
+        b.run()     # BQSR bins the qualities which makes a significantly smaller bam. Get binned file size
 
     gathered_bams_path = f'{tmp_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr'
     gathered_bams = b.read_input_group(**{'bam': f'{gathered_bams_path}.bam',
@@ -1258,14 +1272,15 @@ def pre_process_bam(
     )
 
     # Convert the final merged recalibrated BAM file to CRAM format
-    convert_to_cram(
-        b=b,
-        input_bam=gathered_bams,
-        fasta_reference=fasta_reference,
-        output_bam_prefix=output_bam_prefix,
-        disk_size=(2 * binned_qual_bam_size) + ref_size + additional_disk,
-        out_dir=out_dir
-    )
+    if not hfs.exists(f'{out_dir}/gatk_vc/crams/{output_bam_prefix}.cram'):
+        convert_to_cram(
+            b=b,
+            input_bam=gathered_bams,
+            fasta_reference=fasta_reference,
+            output_bam_prefix=output_bam_prefix,
+            disk_size=(2 * binned_qual_bam_size) + ref_size + additional_disk,
+            out_dir=out_dir
+        )
     b.run()
 
     # Validate the CRAM file

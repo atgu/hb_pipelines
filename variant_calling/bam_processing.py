@@ -52,6 +52,40 @@ def size(file: str):
 
 # Assume out_dir and tmp_dir are different, and write every intermediate file to tmp_dir and final files to out_dir
 
+# Some files are on CRAM version 2.0 is not supported which is not supported by GATK. We first convert them to
+# BAM using samtools (which handles older CRAM versions) and the pass the BAM to GATK
+def cram_to_bam(
+        b: hb.batch.Batch,
+        input_bam: hb.ResourceFile = None,
+        fasta_reference: hb.ResourceGroup = None,
+        output_bam_prefix: str = None,
+        disk_size: Union[float, int] = None,
+        img: str = 'docker.io/broadinstitute/gatk:latest',
+        memory: str = 'standard',
+        ncpu: int = 8,
+        tmp_dir: str = None
+) -> Job:
+    j = b.new_job(name=f'CramToBam: {output_bam_prefix}')
+
+    j.cpu(ncpu)
+    j.image(img)
+    j.memory(memory)
+    j.storage(f'{disk_size}Gi')
+
+    j.command(f"""samtools index {input_bam}""")
+    j.command(
+        f"""
+        samtools view -@{ncpu} -b -T {fasta_reference['fasta']} -o output_converted.bam {input_bam}
+        """
+    )
+
+    j.command(f'mv output_converted.bam {j.ofile}')
+
+    b.write_output(j.ofile, f'{tmp_dir}/gatk_vc/cram_to_bam/{output_bam_prefix}.bam')
+
+    return j
+
+
 # 1. Get read groups in a BAM file, so we can parallelize mapping
 def get_read_groups(
         b: hb.batch.Batch,
@@ -101,6 +135,9 @@ def get_read_groups(
 # https://gatk.broadinstitute.org/hc/en-us/articles/4403687183515--How-to-Generate-an-unmapped-BAM-from-FASTQ-or-aligned-BAM
 # https://gatk.broadinstitute.org/hc/en-us/articles/360039568932--How-to-Map-and-clean-up-short-read-sequence-data-efficiently
 # 2. unmap reads
+# set VALIDATION_STRINGENCY=VALIDATION_STRINGENCY to avoid issues like
+# Read name HS27_10303:6:1206:18594:36926#21, Mapped mate should have mate reference name when data is paired-end but
+# some reads are missing a pair
 def bam_to_ubam(
         b: hb.batch.Batch,
         input_bam: hb.ResourceFile,
@@ -143,7 +180,6 @@ def bam_to_ubam(
         gatk --java-options -Xmx{java_mem}g RevertSam \
             -I {input_bam} \
             -O `pwd`/tmp/reverted \
-            --SANITIZE true \
             --MAX_DISCARD_FRACTION 0.005 \
             --ATTRIBUTE_TO_CLEAR XT \
             --ATTRIBUTE_TO_CLEAR XN \
@@ -155,6 +191,7 @@ def bam_to_ubam(
             --RESTORE_ORIGINAL_QUALITIES true \
             --REMOVE_DUPLICATE_INFORMATION true \
             --REMOVE_ALIGNMENT_INFORMATION true \
+            --VALIDATION_STRINGENCY LENIENT \
             --TMP_DIR `pwd`/tmp
         """
     )
@@ -1053,6 +1090,7 @@ def validate_samfile(
 def pre_process_bam(
         b: hb.Batch,
         input_bam: hb.ResourceFile,
+        is_cram_old: bool = False,
         output_bam_prefix: str = None,
         unmapped_bam_size: Union[float, int] = None,
         fasta_reference: hb.ResourceGroup = None,
@@ -1073,6 +1111,7 @@ def pre_process_bam(
     Process one BAM file
     :param b: Batch object to add jobs to
     :param input_bam: input BAM to be processed
+    :param is_cram_old: whether CRAM is version 2.0. If True, a CRAM-to-BAM step is added
     :param output_bam_prefix: prefix that will be used when writing out files
     :param unmapped_bam_size: size of the unmapped BAM file
     :param fasta_reference: reference files. dict, fast, and fasta index required
@@ -1090,6 +1129,26 @@ def pre_process_bam(
     :param utils: dictionary containing paths to public resources and commonly used
     :return: a final Job, and a path to the VCF with VQSR annotations
     """
+    # Convert CRAM to BAM first if old CRAM version
+    if is_cram_old:
+        ref_path = 'gs://gnomaf/genome_reference/hs37d5'
+        ref_tmp = b.read_input_group(**{'fasta': f'{ref_path}.fa',
+                                        'idx': f'{ref_path}.fa.fai',
+                                        'ref_dict': f'{ref_path}.dict'})
+        cram_to_bam(
+            b=b,
+            input_bam=input_bam,
+            output_bam_prefix=output_bam_prefix,
+            fasta_reference=ref_tmp,
+            disk_size=unmapped_bam_size + 2.0*unmapped_bam_size + additional_disk,
+            tmp_dir=tmp_dir
+        )
+        b.run()
+
+        input_bam = b.read_input(f'{tmp_dir}/gatk_vc/cram_to_bam/{output_bam_prefix}.bam')
+    else:
+        input_bam = input_bam
+
     if not hfs.exists(f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt'):
         get_read_groups(
             b=b,
@@ -1305,6 +1364,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-files', type=str, required=True)
     parser.add_argument('--out-dir', type=str, required=True)
+    parser.add_argument('--old-cram-version', action='store_true')
     parser.add_argument('--tmp-dir', type=str, required=True)
     parser.add_argument('--billing-project', type=str, required=True)
 
@@ -1357,6 +1417,7 @@ def main():
         pre_process_bam(
             b=batch,
             input_bam=bam_file,
+            is_cram_old=args.old_cram_version,
             output_bam_prefix=bam_prefix,
             unmapped_bam_size=bam_size,
             fasta_reference=ref_fasta,
@@ -1368,8 +1429,6 @@ def main():
             tmp_dir=args.tmp_dir,
             utils=inputs
         )
-
-    # batch.run()
 
 
 if __name__ == '__main__':

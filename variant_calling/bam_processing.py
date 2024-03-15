@@ -4,10 +4,10 @@ __author__ = 'Sophie Parsa & Lindo Nkambule'
 import argparse
 import hailtop.batch as hb
 import hailtop.fs as hfs
-import os
 import pandas as pd
 from hailtop.batch.job import Job
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Tuple
+import bam_processing_wrapper as wrapper
 
 
 # GATK Best Practices
@@ -82,7 +82,6 @@ def cram_to_bam(
 
     j.command(f'mv output_converted.bam {j.ofile}')
 
-    # b.write_output(j.ofile, f'{tmp_dir}/gatk_vc/cram_to_bam/{output_bam_prefix}.bam')
     b.write_output(j.ofile, f'{tmp_dir}/{output_bam_prefix}.bam')
 
     return j
@@ -129,7 +128,6 @@ def get_read_groups(
     """)
 
     # write a file containing read group ID per line, so we can loop through it when mapping
-    # b.write_output(j.ofile, f'{tmp_dir}/gatk_vc/read_group_ids/{output_bam_prefix}.rgs.txt')
     b.write_output(j.ofile, f'{tmp_dir}/{output_bam_prefix}.rgs.txt')
 
     return j
@@ -243,8 +241,6 @@ def sam_to_fastq_and_bwa_mem_and_mba(
             'bam': '{root}.bam'
         }
     )
-
-    # input_bam = b.read_input(f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg}.unmapped.bam')
 
     j.image(img)
     j.cpu(ncpu)
@@ -372,10 +368,6 @@ def mark_duplicates(
         """
     )
 
-    # b.write_output(j.output_bam,
-    #                f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.aligned.unsorted.duplicates_marked')
-    # b.write_output(j.markdup_metrics,
-    #                f'{tmp_dir}/gatk_vc/mark_duplicates/{output_bam_prefix}.marked_dup_metrics.txt')
     b.write_output(j.output_bam,
                    f'{tmp_dir}/{output_bam_prefix}.aligned.unsorted.duplicates_marked')
     b.write_output(j.markdup_metrics,
@@ -559,8 +551,6 @@ def check_contamination(
     )
 
     # use FREEMIX=$(tail -n +2 {j.output['selfSM']} | awk '{{print $7}}') to extract freemix estimate downstream (HC)
-    # b.write_output(j.output,
-    #                f'{out_dir}/gatk_vc/VerifyBamID/{output_bam_prefix}')
     b.write_output(j.output, f'{out_dir}/{output_bam_prefix}')
 
     return j
@@ -849,8 +839,6 @@ def gather_bam_files(
         """
     )
 
-    # b.write_output(j.gathered_bams,
-    #                f'{tmp_dir}/gatk_vc/bqsr/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr')
     b.write_output(j.gathered_bams,
                    f'{tmp_dir}/{output_bam_prefix}.aligned.duplicate_marked.sorted.bqsr')
 
@@ -913,7 +901,6 @@ def convert_to_cram(
     )
 
     # DEFINITELY write this out to a bucket
-    # b.write_output(j.output_cram, f'{out_dir}/gatk_vc/crams/{output_bam_prefix}')
     b.write_output(j.output_cram, f'{out_dir}/{output_bam_prefix}')
 
     return j
@@ -945,7 +932,6 @@ def collect_aggregation_metrics(
     j.image(img)
     j.memory(f'{memory}Gi')
     j.storage(f'{disk_size}Gi')
-    # java_mem = int((ncpu * memory) * 0.5)
 
     j.command(
         f"""
@@ -1038,8 +1024,6 @@ with open("chimerism.csv") as chimfile:
         cp is_outlier_data.txt {j.is_outlier_data}
     """)
 
-    # b.write_output(j.is_outlier_data,
-    #                f'{tmp_dir}/gatk_vc/check_pre_validation/{output_bam_prefix}.is.outlier.txt')
     b.write_output(j.is_outlier_data,
                    f'{tmp_dir}/{output_bam_prefix}.is.outlier.txt')
 
@@ -1104,11 +1088,9 @@ def validate_samfile(
     return j
 
 
-# Run a single sample (either one BAM/CRAM or multiple BAMs/CRAMs) through the entire processing workflow
-def pre_process_bam(
+def process_samples(
         b: hb.Batch,
-        sample: str,
-        input_bams: List[str],
+        samples_and_bams: List[Tuple[str, str]],
         is_cram_old: bool = False,
         fasta_reference: hb.ResourceGroup = None,
         bwa_reference_files: hb.ResourceGroup = None,
@@ -1127,8 +1109,7 @@ def pre_process_bam(
     """
     Process one BAM file
     :param b: Batch object to add jobs to
-    :param sample: sample ID for the BAM file(s) to be processed
-    :param input_bams: input BAM file(s) belonging to the same sample to be processed
+    :param samples_and_bams: list of sample IDs and their corresponding BAM/CRAM file(s) to be processed
     :param is_cram_old: whether CRAM is version 2.0. If True, a CRAM-to-BAM step is added
     :param fasta_reference: reference files. dict, fast, and fasta index required
     :param bwa_reference_files: reference files required by BWA
@@ -1145,244 +1126,64 @@ def pre_process_bam(
     :param utils: dictionary containing paths to public resources and commonly used
     :return: a final Job, and a path to the VCF with VQSR annotations
     """
-    bam_idx = [i for i in range(len(input_bams))]   # indices for file output names
-    mapped_bam_total_size = 0   # Sum the bam sizes to approximate the aggregated bam size
-    bams_rg_mapped = []
+    if is_cram_old:
+        wrapper.cram_to_bam_wrapper(b=b,
+                                    samples_and_bams=samples_and_bams,
+                                    additional_disk=additional_disk,
+                                    tmp_dir=tmp_dir)
 
-    for bam, idx in zip(input_bams, bam_idx):
-        bam_file = b.read_input(bam)
-        bam_prefix = f'{sample}_{idx}'
-        unmapped_bam_size = size(bam)
+    wrapper.get_read_groups_wrapper(b=b,
+                                    samples_and_bams=samples_and_bams,
+                                    is_cram_old=is_cram_old,
+                                    tmp_dir=tmp_dir)
 
-        # Convert CRAM to BAM first if old CRAM version
-        if is_cram_old:
-            ref_path = 'gs://gnomaf/genome_reference/hs37d5'
-            ref_tmp = b.read_input_group(**{'fasta': f'{ref_path}.fa',
-                                            'idx': f'{ref_path}.fa.fai',
-                                            'ref_dict': f'{ref_path}.dict'})
-            cram_to_bam(
-                b=b,
-                input_bam=bam_file,
-                output_bam_prefix=bam_prefix,
-                fasta_reference=ref_tmp,
-                disk_size=unmapped_bam_size + 2.0*unmapped_bam_size + additional_disk,
-                tmp_dir=f'{tmp_dir}/cram_to_bam/{sample}'
-            )
-            b.run()
+    wrapper.bam_to_ubam_wrapper(b=b,
+                                samples_and_bams=samples_and_bams,
+                                is_cram_old=is_cram_old,
+                                additional_disk=additional_disk,
+                                tmp_dir=tmp_dir)
 
-            input_bam = b.read_input(f'{tmp_dir}/cram_to_bam/{sample}/{bam_prefix}.bam')
-        else:
-            input_bam = bam_file
+    wrapper.sam_to_fastq_and_bwa_mem_and_mba_wrapper(b=b,
+                                                     samples_and_bams=samples_and_bams,
+                                                     bwa_reference_files=bwa_reference_files,
+                                                     bwa_ref_size=bwa_ref_size,
+                                                     bwa_disk_multiplier=bwa_disk_multiplier,
+                                                     additional_disk=additional_disk,
+                                                     tmp_dir=tmp_dir)
 
-        if not hfs.exists(f'{tmp_dir}/read_group_ids/{sample}/{bam_prefix}.rgs.txt'):
-            get_read_groups(
-                b=b,
-                input_bam=input_bam,
-                output_bam_prefix=bam_prefix,
-                storage=unmapped_bam_size,
-                tmp_dir=f'{tmp_dir}/read_group_ids/{sample}'
-            )
-            b.run()
+    wrapper.mark_duplicates_wrapper(b=b,
+                                    samples_and_bams=samples_and_bams,
+                                    additional_disk=additional_disk,
+                                    md_disk_multiplier=md_disk_multiplier,
+                                    tmp_dir=tmp_dir)
 
-        bam_rg_ids = hfs.open(f'{tmp_dir}/read_group_ids/{sample}/{bam_prefix}.rgs.txt').readlines()
-        rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
+    wrapper.sort_contam_bqsr_gather(b=b,
+                                    samples_and_bams=samples_and_bams,
+                                    fasta_reference=fasta_reference,
+                                    haplotype_database_file=haplotype_database_file,
+                                    contamination_sites=contamination_sites,
+                                    ref_size=ref_size,
+                                    additional_disk=additional_disk,
+                                    sort_sam_disk_multiplier=sort_sam_disk_multiplier,
+                                    out_dir=out_dir,
+                                    tmp_dir=tmp_dir,
+                                    utils=utils)
 
-        # first check if unmapped BAMs exist
-        ubams_exist = [hfs.exists(f'{tmp_dir}/unmapped_bams/{sample}/{bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
+    wrapper.more_qc_wrapper(b=b,
+                            samples_and_bams=samples_and_bams,
+                            fasta_reference=fasta_reference,
+                            ref_size=ref_size,
+                            additional_disk=additional_disk,
+                            out_dir=out_dir,
+                            tmp_dir=tmp_dir)
 
-        if not all(ubams_exist):
-            # unmap BAM to multiple uBAM files split by read group
-            bam_to_ubam(
-                b=b,
-                input_bam=input_bam,
-                output_bam_prefix=bam_prefix,
-                rg_ids=rgs,
-                disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
-                tmp_dir=f'{tmp_dir}/unmapped_bams/{sample}'
-            )
-            b.run()     # call this, so we can be able to get file sizes of readgroup BAM files
-
-        # map uBAM files in parallel
-        # b.run() doesn't allow reading files from a job executed by one b.run() in a job executed by a different b.run()
-        unmapped_bams = [b.read_input(f'{tmp_dir}/unmapped_bams/{sample}/{bam_prefix}/{rg}.unmapped.bam') for
-                         rg in rgs]
-        unmapped_bam_sizes = [size(f'{tmp_dir}/unmapped_bams/{sample}/{bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
-
-        bams_exist = [hfs.exists(f'{tmp_dir}/unmapped_bams/{sample}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
-                      rg in rgs]
-
-        if not all(bams_exist):
-            # list of BAM files that do not exist
-            not_mapped = [(unmapped_bams[i], rgs[i], unmapped_bam_sizes[i]) for i, val in enumerate(bams_exist) if not val]
-
-            bams_rg_mapped = [
-                sam_to_fastq_and_bwa_mem_and_mba(
-                    b=b,
-                    input_bam=bam,
-                    output_bam_prefix=bam_prefix,
-                    rg=rg,
-                    fasta_reference=bwa_reference_files,
-                    disk_size=round(unmapped_bam_size+bwa_ref_size+(bwa_disk_multiplier*unmapped_bam_size)+additional_disk),
-                    tmp_dir=f'{tmp_dir}/mapped_bams/{sample}'
-                ).output_bam
-                for bam, rg, unmapped_bam_size in not_mapped
-            ]
-            b.run()
-
-        mapped_bam_total_size += sum([size(f'{tmp_dir}/mapped_bams/{sample}/{bam_prefix}/{rg}.aligned.unsorted.bam')
-                                      for rg in rgs])
-        bams_mapped = [b.read_input(f'{tmp_dir}/mapped_bams/{sample}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
-                       rg in rgs]
-        bams_rg_mapped.append(bams_mapped)
-
-    # MarkDuplicates and SortSam currently take too long for preemptibles if the input data is too large
-    use_preemptible = not mapped_bam_total_size > 110.0
-
-    if not hfs.exists(f'{tmp_dir}/mark_duplicates/{sample}.aligned.unsorted.duplicates_marked.bam'):
-        mark_duplicates(
-            b=b,
-            input_bams=bams_rg_mapped,
-            output_bam_prefix=sample,
-            use_preemptible_worker=use_preemptible,
-            disk_size=(md_disk_multiplier * mapped_bam_total_size) + additional_disk,
-            tmp_dir=f'{tmp_dir}/mark_duplicates'
-        )
-        b.run()
-
-    bam_md = b.read_input(f'{tmp_dir}/mark_duplicates/{sample}.aligned.unsorted.duplicates_marked.bam')
-    agg_bam_size = size(f'{tmp_dir}/mark_duplicates/{sample}.aligned.unsorted.duplicates_marked.bam')
-
-    sort_sam_bam = picard_sort_bam(
-        b=b,
-        input_bam=bam_md,
-        output_bam_prefix=sample,
-        disk_size=(sort_sam_disk_multiplier * agg_bam_size) + additional_disk
-    ).output_bam
-
-    # CrosscheckFingerprints requires a haplotype map file
-    if haplotype_database_file:
-        cross_check_fingerprints(b=b,
-                                 input_bam=sort_sam_bam,
-                                 haplotype_database_file=haplotype_database_file,
-                                 output_bam_prefix=sample,
-                                 disk_size=agg_bam_size + additional_disk
-                                 )
-
-    check_contamination(
-        b=b,
-        input_bam=sort_sam_bam,
-        output_bam_prefix=f'{sample}.preBqsr',
-        fasta_reference=fasta_reference,
-        contamination_sites=contamination_sites,
-        disk_size=agg_bam_size + ref_size + additional_disk,
-        out_dir=out_dir
-    )
-
-    if not hfs.exists(f'{tmp_dir}/bqsr/{sample}.aligned.duplicate_marked.sorted.bqsr.bam'):
-        seq_grouping = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping.txt').readlines()
-        seq_grouping_subgroup = [l.split('\t') for l in seq_grouping]
-        potential_bqsr_divisor = len(seq_grouping_subgroup) - 10
-        bqsr_divisor = potential_bqsr_divisor if potential_bqsr_divisor > 1 else 1
-
-        bqsr_reports = [
-            base_recalibrator(
-                b=b,
-                input_bam=sort_sam_bam,
-                fasta_reference=fasta_reference,
-                output_bam_prefix=sample,
-                sequence_group_interval=subgroup,
-                utils=utils,
-                disk_size=agg_bam_size + ref_size + additional_disk
-            ).recalibration_report
-            for subgroup in seq_grouping_subgroup
-        ]
-
-        gathered_bqsr_report = gather_bqsr_reports(
-            b=b,
-            input_bqsr_reports=[report for report in bqsr_reports],
-            output_bam_prefix=sample,
-            disk_size=5
-        ).output_bqsr_report
-
-        seq_grouping_with_unmapped = hfs.open('gs://h3africa/variant_calling_resources/hg38_sequence_grouping_with_unmapped.txt').readlines()
-        seq_grouping_with_unmapped_subgroup = [l.split('\t') for l in seq_grouping_with_unmapped]
-
-        # Apply the recalibration model by interval
-        recalibrated_bams = [
-            apply_bqsr(
-                b=b,
-                input_bam=sort_sam_bam,
-                fasta_reference=fasta_reference,
-                output_bam_prefix=sample,
-                bsqr_report=gathered_bqsr_report,
-                sequence_group_interval=subgroup,
-                disk_size=agg_bam_size + (agg_bam_size / bqsr_divisor) + ref_size + additional_disk
-            ).output_bam
-            for subgroup in seq_grouping_with_unmapped_subgroup
-        ]
-
-        # Merge the recalibrated BAM files resulting from by-interval recalibration
-        gather_bam_files(
-            b=b,
-            input_bams=recalibrated_bams,
-            output_bam_prefix=sample,
-            disk_size=(2 * agg_bam_size) + additional_disk,
-            tmp_dir=f'{tmp_dir}/bqsr'
-        )
-
-        b.run()     # BQSR bins the qualities which makes a significantly smaller bam. Get binned file size
-
-    gathered_bams_path = f'{tmp_dir}/bqsr/{sample}.aligned.duplicate_marked.sorted.bqsr'
-    gathered_bams = b.read_input_group(**{'bam': f'{gathered_bams_path}.bam',
-                                       'bam.bai': f'{gathered_bams_path}.bam.bai'})
-    binned_qual_bam_size = size(f'{gathered_bams_path}.bam')
-
-    # QC the final BAM some more (no such thing as too much QC)
-    agg_metrics = collect_aggregation_metrics(
-        b=b,
-        input_bam=gathered_bams,
-        fasta_reference=fasta_reference,
-        output_bam_prefix=sample,
-        disk_size=binned_qual_bam_size + ref_size + additional_disk
-    ).output
-
-    mark_dup_metrics = b.read_input(f'{tmp_dir}/mark_duplicates/{sample}.marked_dup_metrics.txt')
-    check_pre_validation(
-        b=b,
-        output_bam_prefix=sample,
-        duplication_metrics=mark_dup_metrics,
-        chimerism_metrics=agg_metrics['alignment_summary_metrics'],
-        tmp_dir=f'{tmp_dir}/check_pre_validation'
-    )
-
-    # Convert the final merged recalibrated BAM file to CRAM format
-    if not hfs.exists(f'{out_dir}/gatk_vc/crams/{sample}.cram'):
-        convert_to_cram(
-            b=b,
-            input_bam=gathered_bams,
-            fasta_reference=fasta_reference,
-            output_bam_prefix=sample,
-            disk_size=(2 * binned_qual_bam_size) + ref_size + additional_disk,
-            out_dir=f'{out_dir}/crams/'
-        )
-    b.run()
-
-    # Validate the CRAM file
-    cram_file = b.read_input_group(**{'cram': f'{out_dir}/crams/{sample}.cram',
-                                      'cram.crai': f'{out_dir}/crams/{sample}.cram.crai'})
-    cram_size = size(f'{out_dir}/crams/{sample}.cram')
-
-    pre_val_metric = b.read_input(f'{tmp_dir}/check_pre_validation/{sample}.is.outlier.txt')
-
-    validate_samfile(
-        b=b,
-        input_bam=cram_file,
-        fasta_reference=fasta_reference,
-        output_bam_prefix=sample,
-        is_outlier_data=pre_val_metric,
-        disk_size=cram_size + ref_size + additional_disk
-    )
-    b.run()
+    wrapper.validate_samfile_wrapper(b=b,
+                                     samples_and_bams=samples_and_bams,
+                                     fasta_reference=fasta_reference,
+                                     ref_size=ref_size,
+                                     additional_disk=additional_disk,
+                                     out_dir=out_dir,
+                                     tmp_dir=tmp_dir)
 
 
 def main():
@@ -1432,27 +1233,19 @@ def main():
     bams = pd.read_csv(args.input_files, sep='\t', header=None, names=['id', 'files'])
     files = [(sample, paths) for sample, paths in zip(bams['id'], bams['files'])]
 
-    print(files)
-
-    for sample_id, sample_bams in files:
-        sample_bam_file_paths = sample_bams.split(',')
-
-        pre_process_bam(
-            b=batch,
-            sample=sample_id,
-            input_bams=sample_bam_file_paths,
-            is_cram_old=args.old_cram_version,
-            fasta_reference=ref_fasta,
-            bwa_reference_files=ref_fasta_bwa,
-            contamination_sites=contamination_sites,
-            ref_size=ref_size,
-            bwa_ref_size=bwa_ref_size,
-            out_dir=args.out_dir,
-            tmp_dir=args.tmp_dir,
-            utils=inputs
-        )
-
-    batch.run()
+    process_samples(
+        b=batch,
+        samples_and_bams=files,
+        is_cram_old=args.old_cram_version,
+        fasta_reference=ref_fasta,
+        bwa_reference_files=ref_fasta_bwa,
+        contamination_sites=contamination_sites,
+        ref_size=ref_size,
+        bwa_ref_size=bwa_ref_size,
+        out_dir=args.out_dir,
+        tmp_dir=args.tmp_dir,
+        utils=inputs
+    )
 
 
 if __name__ == '__main__':

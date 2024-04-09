@@ -171,7 +171,7 @@ def bam_to_ubam_num_reads_wrapper(
 def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
-        split_by_rg: bool = True,
+        split_by_nr: bool = False,
         bwa_reference_files: hb.ResourceGroup = None,
         bwa_ref_size: Union[float, int] = None,
         bwa_disk_multiplier: float = 2.5,
@@ -186,7 +186,7 @@ def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
             bam_prefix = f'{sample_id}_{idx}'
 
             # # NOTE: some files will be split by number of reads instead of read groups, incorporate that below (paths)
-            if split_by_rg:
+            if not split_by_nr:
                 bam_rg_ids = hfs.open(f'{tmp_dir}/read_group_ids/{sample_id}/{bam_prefix}.rgs.txt').readlines()
                 rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
 

@@ -1199,7 +1199,7 @@ def process_samples(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
         is_cram_old: bool = False,
-        split_by_rg: bool = True,
+        split_by_nr: bool = False,
         n_reads: int = 1_000_000,
         fasta_reference: hb.ResourceGroup = None,
         bwa_reference_files: hb.ResourceGroup = None,
@@ -1220,7 +1220,7 @@ def process_samples(
     :param b: Batch object to add jobs to
     :param samples_and_bams: list of sample IDs and their corresponding BAM/CRAM file(s) to be processed
     :param is_cram_old: whether CRAM is version 2.0. If True, a CRAM-to-BAM step is added
-    :param split_by_rg: to split input BAM by read group or not (split by number of reads)
+    :param split_by_nr: to split input BAM by number of reads (or split by read group)
     :param n_reads: number of reads to split input BAM by (alternative to splitting by RG, good for very large BAMs)
     :param fasta_reference: reference files. dict, fast, and fasta index required
     :param bwa_reference_files: reference files required by BWA
@@ -1243,7 +1243,8 @@ def process_samples(
                                     additional_disk=additional_disk,
                                     tmp_dir=tmp_dir)
 
-    if split_by_rg:
+    if not split_by_nr:
+        print('--- Input files to be split by read group ---')
         wrapper.get_read_groups_wrapper(b=b,
                                         samples_and_bams=samples_and_bams,
                                         is_cram_old=is_cram_old,
@@ -1256,6 +1257,7 @@ def process_samples(
                                        tmp_dir=tmp_dir)
     # else split by number of reads
     else:
+        print('--- Input files to be split by number of reads ---')
         wrapper.split_by_num_reads_wrapper(b=b,
                                            samples_and_bams=samples_and_bams,
                                            n_reads=n_reads,
@@ -1269,7 +1271,7 @@ def process_samples(
 
     wrapper.sam_to_fastq_and_bwa_mem_and_mba_wrapper(b=b,
                                                      samples_and_bams=samples_and_bams,
-                                                     split_by_rg=split_by_rg,
+                                                     split_by_nr=split_by_nr,
                                                      bwa_reference_files=bwa_reference_files,
                                                      bwa_ref_size=bwa_ref_size,
                                                      bwa_disk_multiplier=bwa_disk_multiplier,
@@ -1316,6 +1318,7 @@ def main():
     parser.add_argument('--input-files', type=str, required=True)
     parser.add_argument('--out-dir', type=str, required=True)
     parser.add_argument('--old-cram-version', action='store_true')
+    parser.add_argument('--split-by-nr', action='store_true')
     parser.add_argument('--tmp-dir', type=str, required=True)
     parser.add_argument('--billing-project', type=str, required=True)
 
@@ -1362,6 +1365,7 @@ def main():
         b=batch,
         samples_and_bams=files,
         is_cram_old=args.old_cram_version,
+        split_by_nr=args.split_by_nr,
         fasta_reference=ref_fasta,
         bwa_reference_files=ref_fasta_bwa,
         contamination_sites=contamination_sites,

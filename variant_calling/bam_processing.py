@@ -133,13 +133,55 @@ def get_read_groups(
     return j
 
 
+def split_by_num_reads(
+        b: hb.batch.Batch,
+        input_bam: hb.ResourceFile,
+        output_bam_prefix: str = None,
+        disk_size: Union[float, int] = None,
+        n_reads: int = 1_000_000,
+        ncpu: int = 4,
+        docker: str = 'docker.io/broadinstitute/gatk:latest',
+        tmp_dir: str = None
+) -> Job:
+
+    j = b.new_job(name=f'1. SplitSamByNumberOfReads: {output_bam_prefix}')
+
+    j.image(docker)
+    j.memory('standard')
+    j.cpu(ncpu)
+    j.storage(f'{disk_size}Gi')
+
+    j.command(
+        f"""
+        cd /io
+        mkdir tmp/
+        mkdir tmp/reverted/
+            
+        total_reads=$(samtools view -c {input_bam})
+        gatk --java-options "-Xms3000m -Xmx3600m" SplitSamByNumberOfReads \
+            -I {input_bam} \
+            -O `pwd`/tmp/reverted \
+            --SPLIT_TO_N_READS {n_reads} \
+            --TOTAL_READS_IN_INPUT $total_reads \
+            --TMP_DIR `pwd`/tmp
+
+        ls `pwd`/tmp/reverted
+    """
+    )
+
+    j.command(f'mv `pwd`/tmp/reverted {j.reverted}')
+    b.write_output(j.reverted, f'{tmp_dir}/{output_bam_prefix}')
+
+    return j
+
+
 # https://gatk.broadinstitute.org/hc/en-us/articles/4403687183515--How-to-Generate-an-unmapped-BAM-from-FASTQ-or-aligned-BAM
 # https://gatk.broadinstitute.org/hc/en-us/articles/360039568932--How-to-Map-and-clean-up-short-read-sequence-data-efficiently
 # 2. unmap reads
 # set VALIDATION_STRINGENCY=VALIDATION_STRINGENCY to avoid issues like
 # Read name HS27_10303:6:1206:18594:36926#21, Mapped mate should have mate reference name when data is paired-end but
 # some reads are missing a pair
-def bam_to_ubam(
+def bam_to_ubam_rg(
         b: hb.batch.Batch,
         input_bam: hb.ResourceFile,
         output_bam_prefix: str = None,
@@ -199,8 +241,73 @@ def bam_to_ubam(
 
     for rg_id in rg_ids:
         j.command(f"cp tmp/reverted/{rg_id}.bam {j[f'{rg_id}']}")
-        # b.write_output(j[f'{rg_id}'], f'{tmp_dir}/gatk_vc/unmapped_bams/{output_bam_prefix}/{rg_id}.unmapped.bam')
         b.write_output(j[f'{rg_id}'], f'{tmp_dir}/{output_bam_prefix}/{rg_id}.unmapped.bam')
+
+    return j
+
+
+def bam_to_ubam_num_reads(
+        b: hb.batch.Batch,
+        input_bam: hb.ResourceFile,
+        output_bam_prefix: str = None,
+        disk_size: Union[float, int] = None,
+        img: str = 'docker.io/broadinstitute/gatk:latest',
+        memory: str = 'standard',
+        ncpu: int = 8,
+        tmp_dir: str = None
+) -> Job:
+    """
+    Unmap reads
+    :param b: batch
+    :param input_bam: input BAM file to be unmapped
+    :param output_bam_prefix: BAM filename without extension
+    :param img: image to use for the job
+    :param memory: job memory
+    :param ncpu: number of CPUs
+    :param disk_size: disk size to use for the job
+    :param tmp_dir: output directory to write temporary file to
+    :return: Job object
+    """
+    j = b.new_job(name=f'2.BamToUbam: {output_bam_prefix}')
+
+    j.declare_resource_group(
+        unmapped_bam={
+            'bam': '{root}.bam'
+        }
+    )
+
+    j.image(img)
+    j.cpu(ncpu)
+    j.memory(memory)
+    j.storage(f'{disk_size}Gi')
+
+    java_mem = ncpu * 4 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
+
+    j.command(
+        f"""
+        cd /io
+        mkdir tmp/
+        gatk --java-options -Xmx{java_mem}g RevertSam \
+            -I {input_bam} \
+            -O {j.unmapped_bam['bam']} \
+            --MAX_DISCARD_FRACTION 0.005 \
+            --ATTRIBUTE_TO_CLEAR XT \
+            --ATTRIBUTE_TO_CLEAR XN \
+            --ATTRIBUTE_TO_CLEAR AS \
+            --ATTRIBUTE_TO_CLEAR OC \
+            --ATTRIBUTE_TO_CLEAR OP \
+            --OUTPUT_BY_READGROUP false \
+            --SORT_ORDER queryname \
+            --RESTORE_ORIGINAL_QUALITIES true \
+            --REMOVE_DUPLICATE_INFORMATION true \
+            --REMOVE_ALIGNMENT_INFORMATION true \
+            --VALIDATION_STRINGENCY LENIENT \
+            --TMP_DIR `pwd`/tmp
+        """
+    )
+
+    b.write_output(j.unmapped_bam,
+                   f'{tmp_dir}/{output_bam_prefix}.unmapped')
 
     return j
 
@@ -226,7 +333,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
     :param output_bam_prefix: BAM filename without extension
     :param fasta_reference: reference genome files to be used in alignment
     :param compression_level: compression level
-    :param rg: read group ID
+    :param rg: read group ID or shard (splitting by number of reads)
     :param img: image to use for the job
     :param memory: job memory
     :param ncpu: number of CPUs
@@ -1092,6 +1199,8 @@ def process_samples(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
         is_cram_old: bool = False,
+        split_by_rg: bool = True,
+        n_reads: int = 1_000_000,
         fasta_reference: hb.ResourceGroup = None,
         bwa_reference_files: hb.ResourceGroup = None,
         haplotype_database_file: hb.ResourceGroup = None,
@@ -1111,6 +1220,8 @@ def process_samples(
     :param b: Batch object to add jobs to
     :param samples_and_bams: list of sample IDs and their corresponding BAM/CRAM file(s) to be processed
     :param is_cram_old: whether CRAM is version 2.0. If True, a CRAM-to-BAM step is added
+    :param split_by_rg: to split input BAM by read group or not (split by number of reads)
+    :param n_reads: number of reads to split input BAM by (alternative to splitting by RG, good for very large BAMs)
     :param fasta_reference: reference files. dict, fast, and fasta index required
     :param bwa_reference_files: reference files required by BWA
     :param haplotype_database_file: haplotype database file
@@ -1132,19 +1243,33 @@ def process_samples(
                                     additional_disk=additional_disk,
                                     tmp_dir=tmp_dir)
 
-    wrapper.get_read_groups_wrapper(b=b,
-                                    samples_and_bams=samples_and_bams,
-                                    is_cram_old=is_cram_old,
-                                    tmp_dir=tmp_dir)
+    if split_by_rg:
+        wrapper.get_read_groups_wrapper(b=b,
+                                        samples_and_bams=samples_and_bams,
+                                        is_cram_old=is_cram_old,
+                                        tmp_dir=tmp_dir)
 
-    wrapper.bam_to_ubam_wrapper(b=b,
-                                samples_and_bams=samples_and_bams,
-                                is_cram_old=is_cram_old,
-                                additional_disk=additional_disk,
-                                tmp_dir=tmp_dir)
+        wrapper.bam_to_ubam_rg_wrapper(b=b,
+                                       samples_and_bams=samples_and_bams,
+                                       is_cram_old=is_cram_old,
+                                       additional_disk=additional_disk,
+                                       tmp_dir=tmp_dir)
+    # else split by number of reads
+    else:
+        wrapper.split_by_num_reads_wrapper(b=b,
+                                           samples_and_bams=samples_and_bams,
+                                           n_reads=n_reads,
+                                           additional_disk=additional_disk,
+                                           tmp_dir=tmp_dir)
+
+        wrapper.bam_to_ubam_num_reads_wrapper(b=b,
+                                              samples_and_bams=samples_and_bams,
+                                              additional_disk=additional_disk,
+                                              tmp_dir=tmp_dir)
 
     wrapper.sam_to_fastq_and_bwa_mem_and_mba_wrapper(b=b,
                                                      samples_and_bams=samples_and_bams,
+                                                     split_by_rg=split_by_rg,
                                                      bwa_reference_files=bwa_reference_files,
                                                      bwa_ref_size=bwa_ref_size,
                                                      bwa_disk_multiplier=bwa_disk_multiplier,

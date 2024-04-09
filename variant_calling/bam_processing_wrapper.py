@@ -72,7 +72,35 @@ def get_read_groups_wrapper(
     b.run()
 
 
-def bam_to_ubam_wrapper(
+def split_by_num_reads_wrapper(
+        b: hb.Batch,
+        samples_and_bams: List[Tuple[str, str]],
+        n_reads: int = 1_000_000,
+        additional_disk: float = 20.0,
+        tmp_dir: str = None
+):
+    for sample_id, sample_bams in samples_and_bams:
+        sample_bam_file_paths = sample_bams.split(',')
+        bam_idx = [i for i in range(len(sample_bam_file_paths))]
+
+        for bam, idx in zip(sample_bam_file_paths, bam_idx):
+            unmapped_bam_size = jobs.size(bam)
+            input_bam = b.read_input(bam)
+
+            # unmap BAM to multiple uBAM files split by read group
+            jobs.split_by_num_reads(
+                b=b,
+                input_bam=input_bam,
+                output_bam_prefix=sample_id,
+                n_reads=n_reads,
+                disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
+                tmp_dir=f'{tmp_dir}/bams_plit_by_reads'
+            )
+
+    b.run()
+
+
+def bam_to_ubam_rg_wrapper(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
         is_cram_old: bool = False,
@@ -100,7 +128,7 @@ def bam_to_ubam_wrapper(
 
             if not all(ubams_exist):
                 # unmap BAM to multiple uBAM files split by read group
-                jobs.bam_to_ubam(
+                jobs.bam_to_ubam_rg(
                     b=b,
                     input_bam=input_bam,
                     output_bam_prefix=bam_prefix,
@@ -112,9 +140,38 @@ def bam_to_ubam_wrapper(
     b.run()
 
 
+def bam_to_ubam_num_reads_wrapper(
+        b: hb.Batch,
+        samples_and_bams: List[Tuple[str, str]],
+        additional_disk: float = 20.0,
+        tmp_dir: str = None
+):
+    for sample_id, sample_bams in samples_and_bams:
+        split_ls = hfs.ls(f'{tmp_dir}/bams_plit_by_reads/{sample_id}/*.bam')
+        split_bam_paths = [i.path for i in split_ls]
+        bam_idx = [f'shard_{i}' for i in range(len(split_bam_paths))]
+
+        for bam, idx in zip(split_bam_paths, bam_idx):
+            bam_prefix = f'{sample_id}_{idx}'
+            unmapped_bam_size = jobs.size(bam)
+            input_bam = b.read_input(bam)
+
+            # unmap BAM to multiple uBAM files split by number of reads
+            jobs.bam_to_ubam_num_reads(
+                b=b,
+                input_bam=input_bam,
+                output_bam_prefix=bam_prefix,
+                disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
+                tmp_dir=f'{tmp_dir}/unmapped_bams/{sample_id}'
+            )
+
+    b.run()
+
+
 def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
+        split_by_rg: bool = True,
         bwa_reference_files: hb.ResourceGroup = None,
         bwa_ref_size: Union[float, int] = None,
         bwa_disk_multiplier: float = 2.5,
@@ -128,17 +185,28 @@ def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
         for _, idx in zip(sample_bam_file_paths, bam_idx):
             bam_prefix = f'{sample_id}_{idx}'
 
-            bam_rg_ids = hfs.open(f'{tmp_dir}/read_group_ids/{sample_id}/{bam_prefix}.rgs.txt').readlines()
-            rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
+            # # NOTE: some files will be split by number of reads instead of read groups, incorporate that below (paths)
+            if split_by_rg:
+                bam_rg_ids = hfs.open(f'{tmp_dir}/read_group_ids/{sample_id}/{bam_prefix}.rgs.txt').readlines()
+                rgs = [l.strip() for l in bam_rg_ids]   # rgs have a \n at the end, hence the .strip()
 
-            # map uBAM files in parallel
-            # NOTE: some files will be split by number of reads instead of read groups, incorporate that below (paths)
-            unmapped_bams = [b.read_input(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.unmapped.bam') for
-                             rg in rgs]
-            unmapped_bam_sizes = [jobs.size(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
+                # map uBAM files in parallel
+                unmapped_bams = [b.read_input(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.unmapped.bam') for
+                                 rg in rgs]
+                unmapped_bam_sizes = [jobs.size(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
 
-            bams_exist = [hfs.exists(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
-                          rg in rgs]
+                bams_exist = [hfs.exists(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
+                              rg in rgs]
+
+            else:
+                unmapped_ls = hfs.ls(f'{tmp_dir}/unmapped_bams/{sample_id}/*.bam')
+                unmapped_bam_paths = [i.path for i in unmapped_ls]
+                unmapped_bams = [b.read_input(i) for i in unmapped_bam_paths]
+                unmapped_bam_sizes = [jobs.size(i) for i in unmapped_bam_paths]
+
+                bams_exist = [hfs.exists(i) for i in unmapped_bam_paths]
+                # not really rgs here but shards, but we use trg for consistency
+                rgs = [f'shard_{i}' for i in range(len(unmapped_bam_paths))]
 
             if not all(bams_exist):
                 # list of BAM files that do not exist

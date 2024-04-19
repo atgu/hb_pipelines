@@ -1200,6 +1200,7 @@ def process_samples(
         samples_and_bams: List[Tuple[str, str]],
         is_cram_old: bool = False,
         split_by_nr: bool = False,
+        steps: str = 'unmap,map,mdups,bqsr',
         n_reads: int = 1_000_000,
         fasta_reference: hb.ResourceGroup = None,
         bwa_reference_files: hb.ResourceGroup = None,
@@ -1221,6 +1222,7 @@ def process_samples(
     :param samples_and_bams: list of sample IDs and their corresponding BAM/CRAM file(s) to be processed
     :param is_cram_old: whether CRAM is version 2.0. If True, a CRAM-to-BAM step is added
     :param split_by_nr: to split input BAM by number of reads (or split by read group)
+    :param steps: steps to run. Good for resuming jobs and assumes previous steps were run using this pipeline
     :param n_reads: number of reads to split input BAM by (alternative to splitting by RG, good for very large BAMs)
     :param fasta_reference: reference files. dict, fast, and fasta index required
     :param bwa_reference_files: reference files required by BWA
@@ -1237,64 +1239,77 @@ def process_samples(
     :param utils: dictionary containing paths to public resources and commonly used
     :return: a final Job, and a path to the VCF with VQSR annotations
     """
+    steps_list = steps.split(',')
+    steps_to_run = [x.lower() for x in steps_list]
+    unknown_steps = [i for i in steps_to_run if i not in ['unmap', 'map', 'mdups', 'bqsr']]
+
+    if len(unknown_steps) > 0:
+        raise SystemExit(f'Incorrect process(es) {unknown_steps} selected. Options are [unmap, map, mdups, bqsr]')
+
+    print(f'--- Steps to run: {steps_to_run} ---')
+
     if is_cram_old:
         wrapper.cram_to_bam_wrapper(b=b,
                                     samples_and_bams=samples_and_bams,
                                     additional_disk=additional_disk,
                                     tmp_dir=tmp_dir)
 
-    if not split_by_nr:
-        print('--- Input files to be split by read group ---')
-        wrapper.get_read_groups_wrapper(b=b,
-                                        samples_and_bams=samples_and_bams,
-                                        is_cram_old=is_cram_old,
-                                        tmp_dir=tmp_dir)
+    if 'unmap' in steps_to_run:
+        if not split_by_nr:
+            print('--- Input files to be split by read group ---')
+            wrapper.get_read_groups_wrapper(b=b,
+                                            samples_and_bams=samples_and_bams,
+                                            is_cram_old=is_cram_old,
+                                            tmp_dir=tmp_dir)
 
-        wrapper.bam_to_ubam_rg_wrapper(b=b,
-                                       samples_and_bams=samples_and_bams,
-                                       is_cram_old=is_cram_old,
-                                       additional_disk=additional_disk,
-                                       tmp_dir=tmp_dir)
-    # else split by number of reads
-    else:
-        print('--- Input files to be split by number of reads ---')
-        wrapper.split_by_num_reads_wrapper(b=b,
+            wrapper.bam_to_ubam_rg_wrapper(b=b,
                                            samples_and_bams=samples_and_bams,
-                                           n_reads=n_reads,
+                                           is_cram_old=is_cram_old,
                                            additional_disk=additional_disk,
                                            tmp_dir=tmp_dir)
+        # else split by number of reads
+        else:
+            print('--- Input files to be split by number of reads ---')
+            wrapper.split_by_num_reads_wrapper(b=b,
+                                               samples_and_bams=samples_and_bams,
+                                               n_reads=n_reads,
+                                               additional_disk=additional_disk,
+                                               tmp_dir=tmp_dir)
 
-        wrapper.bam_to_ubam_num_reads_wrapper(b=b,
-                                              samples_and_bams=samples_and_bams,
-                                              additional_disk=additional_disk,
-                                              tmp_dir=tmp_dir)
+            wrapper.bam_to_ubam_num_reads_wrapper(b=b,
+                                                  samples_and_bams=samples_and_bams,
+                                                  additional_disk=additional_disk,
+                                                  tmp_dir=tmp_dir)
 
-    wrapper.sam_to_fastq_and_bwa_mem_and_mba_wrapper(b=b,
-                                                     samples_and_bams=samples_and_bams,
-                                                     split_by_nr=split_by_nr,
-                                                     bwa_reference_files=bwa_reference_files,
-                                                     bwa_ref_size=bwa_ref_size,
-                                                     bwa_disk_multiplier=bwa_disk_multiplier,
-                                                     additional_disk=additional_disk,
-                                                     tmp_dir=tmp_dir)
+    if 'map' in steps_to_run:
+        wrapper.sam_to_fastq_and_bwa_mem_and_mba_wrapper(b=b,
+                                                         samples_and_bams=samples_and_bams,
+                                                         split_by_nr=split_by_nr,
+                                                         bwa_reference_files=bwa_reference_files,
+                                                         bwa_ref_size=bwa_ref_size,
+                                                         bwa_disk_multiplier=bwa_disk_multiplier,
+                                                         additional_disk=additional_disk,
+                                                         tmp_dir=tmp_dir)
 
-    wrapper.mark_duplicates_wrapper(b=b,
-                                    samples_and_bams=samples_and_bams,
-                                    additional_disk=additional_disk,
-                                    md_disk_multiplier=md_disk_multiplier,
-                                    tmp_dir=tmp_dir)
+    if 'mdups' in steps_to_run:
+        wrapper.mark_duplicates_wrapper(b=b,
+                                        samples_and_bams=samples_and_bams,
+                                        additional_disk=additional_disk,
+                                        md_disk_multiplier=md_disk_multiplier,
+                                        tmp_dir=tmp_dir)
 
-    wrapper.sort_contam_bqsr_gather(b=b,
-                                    samples_and_bams=samples_and_bams,
-                                    fasta_reference=fasta_reference,
-                                    haplotype_database_file=haplotype_database_file,
-                                    contamination_sites=contamination_sites,
-                                    ref_size=ref_size,
-                                    additional_disk=additional_disk,
-                                    sort_sam_disk_multiplier=sort_sam_disk_multiplier,
-                                    out_dir=out_dir,
-                                    tmp_dir=tmp_dir,
-                                    utils=utils)
+    if 'bqsr' in steps_to_run:
+        wrapper.sort_contam_bqsr_gather(b=b,
+                                        samples_and_bams=samples_and_bams,
+                                        fasta_reference=fasta_reference,
+                                        haplotype_database_file=haplotype_database_file,
+                                        contamination_sites=contamination_sites,
+                                        ref_size=ref_size,
+                                        additional_disk=additional_disk,
+                                        sort_sam_disk_multiplier=sort_sam_disk_multiplier,
+                                        out_dir=out_dir,
+                                        tmp_dir=tmp_dir,
+                                        utils=utils)
 
     wrapper.more_qc_wrapper(b=b,
                             samples_and_bams=samples_and_bams,
@@ -1319,6 +1334,7 @@ def main():
     parser.add_argument('--out-dir', type=str, required=True)
     parser.add_argument('--old-cram-version', action='store_true')
     parser.add_argument('--split-by-nr', action='store_true')
+    parser.add_argument('--steps', type=str, default='unmap,map,mdups,bqsr')
     parser.add_argument('--tmp-dir', type=str, required=True)
     parser.add_argument('--billing-project', type=str, required=True)
 
@@ -1366,6 +1382,7 @@ def main():
         samples_and_bams=files,
         is_cram_old=args.old_cram_version,
         split_by_nr=args.split_by_nr,
+        steps=args.steps,
         fasta_reference=ref_fasta,
         bwa_reference_files=ref_fasta_bwa,
         contamination_sites=contamination_sites,

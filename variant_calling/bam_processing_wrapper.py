@@ -156,14 +156,17 @@ def bam_to_ubam_num_reads_wrapper(
             unmapped_bam_size = jobs.size(bam)
             input_bam = b.read_input(bam)
 
-            # unmap BAM to multiple uBAM files split by number of reads
-            jobs.bam_to_ubam_num_reads(
-                b=b,
-                input_bam=input_bam,
-                output_bam_prefix=bam_prefix,
-                disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
-                tmp_dir=f'{tmp_dir}/unmapped_bams/{sample_id}'
-            )
+            # first check if unmapped BAM exists
+            ubam_exist = hfs.exists(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}.unmapped.bam')
+            if not ubam_exist:
+                # unmap BAM to multiple uBAM files split by number of reads
+                jobs.bam_to_ubam_num_reads(
+                    b=b,
+                    input_bam=input_bam,
+                    output_bam_prefix=bam_prefix,
+                    disk_size=unmapped_bam_size + unmapped_bam_size*2.5 + additional_disk,
+                    tmp_dir=f'{tmp_dir}/unmapped_bams/{sample_id}'
+                )
 
     b.run()
 
@@ -195,7 +198,7 @@ def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
                                  rg in rgs]
                 unmapped_bam_sizes = [jobs.size(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.unmapped.bam') for rg in rgs]
 
-                bams_exist = [hfs.exists(f'{tmp_dir}/unmapped_bams/{sample_id}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
+                bams_exist = [hfs.exists(f'{tmp_dir}/mapped_bams/{sample_id}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
                               rg in rgs]
 
             else:
@@ -204,9 +207,10 @@ def sam_to_fastq_and_bwa_mem_and_mba_wrapper(
                 unmapped_bams = [b.read_input(i) for i in unmapped_bam_paths]
                 unmapped_bam_sizes = [jobs.size(i) for i in unmapped_bam_paths]
 
-                bams_exist = [hfs.exists(i) for i in unmapped_bam_paths]
-                # not really rgs here but shards, but we use trg for consistency
+                # not really rgs here but shards, but we use rgs for consistency
                 rgs = [f'shard_{i}' for i in range(len(unmapped_bam_paths))]
+                bams_exist = [hfs.exists(f'{tmp_dir}/mapped_bams/{sample_id}/{bam_prefix}/{rg}.aligned.unsorted.bam') for
+                              rg in rgs]
 
             if not all(bams_exist):
                 # list of BAM files that do not exist

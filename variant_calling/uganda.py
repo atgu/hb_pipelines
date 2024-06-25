@@ -4,6 +4,7 @@ import argparse
 import funcs as fun
 import hailtop.batch as hb
 import hailtop.fs as hfs
+import os
 import pandas as pd
 
 from wrappers import sort_contam_bqsr_gather, more_qc_wrapper, validate_samfile_wrapper
@@ -42,6 +43,7 @@ inputs = {
 
 
 # Wrappers
+# unamps old CRAM/BAM and maps uBAM to current reference genome
 def cram_to_bam_wrapper(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
@@ -57,8 +59,7 @@ def cram_to_bam_wrapper(
         bam_idx = [i for i in range(len(sample_bam_file_paths))]
 
         for bam, idx in zip(sample_bam_file_paths, bam_idx):
-            cram_file = b.read_input_group(**{'cram': bam,
-                                              'md5': f'{bam}.md5'})
+            extension = os.path.splitext(os.path.basename(bam))
 
             bam_prefix = f'{sample_id}_{idx}'
             unmapped_bam_size = fun.size(bam)
@@ -66,14 +67,26 @@ def cram_to_bam_wrapper(
             # check if uBAM exists
             ubam_exists = hfs.exists(f'{tmp_dir}/cram_to_ubam/{sample_id}/{bam_prefix}.unmapped.bam')
             if not ubam_exists:
-                ubam = fun.revert_cram_to_ubam(
-                    b=b,
-                    input_cram=cram_file,
-                    output_bam_prefix=bam_prefix,
-                    old_ref_files=old_ref_files,
-                    disk_size=round(unmapped_bam_size + 2.0*unmapped_bam_size + ref_files_size + additional_disk),
-                    tmp_dir=f'{tmp_dir}/cram_to_ubam/{sample_id}'
-                ).output_bam
+                if extension == '.cram':
+                    infile = b.read_input_group(**{'cram': bam,
+                                                   'md5': f'{bam}.md5'})
+                    ubam = fun.revert_cram_to_ubam(
+                        b=b,
+                        input_cram=infile,
+                        output_bam_prefix=bam_prefix,
+                        old_ref_files=old_ref_files,
+                        disk_size=round(unmapped_bam_size + 2.0*unmapped_bam_size + ref_files_size + additional_disk),
+                        tmp_dir=f'{tmp_dir}/cram_to_ubam/{sample_id}'
+                    ).output_bam
+                else:
+                    infile = b.read_input(bam)
+                    ubam = fun.revert_bam_to_ubam(
+                        b=b,
+                        input_bam=infile,
+                        output_bam_prefix=bam_prefix,
+                        disk_size=round(unmapped_bam_size + 2.0*unmapped_bam_size + additional_disk),
+                        tmp_dir=f'{tmp_dir}/cram_to_ubam/{sample_id}'
+                    ).output_bam
             else:
                 ubam = b.read_input(f'{tmp_dir}/cram_to_ubam/{sample_id}/{bam_prefix}.unmapped.bam')
 

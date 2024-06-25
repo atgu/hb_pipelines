@@ -2,9 +2,8 @@ __author__ = 'Lindo Nkambule'
 
 import hailtop.batch as hb
 import hailtop.fs as hfs
-import pandas as pd
 from hailtop.batch.job import Job
-from typing import Dict, List, Union, Tuple
+from typing import List, Union
 
 
 # Functions
@@ -20,6 +19,116 @@ def size(file: str):
     size_gigs = size_bytes / (1024 * 1024 * 1024)
 
     return size_gigs
+
+
+def split_by_num_reads(
+        b: hb.batch.Batch,
+        input_bam: hb.resource.InputResourceFile,
+        output_bam_prefix: str = None,
+        disk_size: Union[float, int] = None,
+        n_reads: int = 1_000_000,
+        ncpu: int = 8,
+        docker: str = 'docker.io/broadinstitute/gatk:latest',
+        tmp_dir: str = None
+) -> Job:
+
+    j = b.new_job(name=f'SplitSamByNumberOfReads: {output_bam_prefix}')
+
+    j.image(docker)
+    j.memory('standard')
+    j.cpu(ncpu)
+    j.storage(f'{disk_size}Gi')
+
+    j.command(
+        f"""cd /io
+        mkdir tmp/
+        gatk --java-options "-Xms3000m -Xmx3600m" SortSam \
+            -I {input_bam} \
+            -O sorted_tmp.bam \
+            -SO queryname \
+            --TMP_DIR `pwd`/tmp
+        """
+    )
+
+    # "Splitting a coordinate sorted bam may result in invalid bams that do not always contain each read's mate in
+    # the same bam" warning when BAM is coordinate sorted. Sort by queryname lexicographically
+    j.command(
+        f"""
+        cd /io
+        mkdir tmp/reverted/
+                    
+        total_reads=$(samtools view -c sorted_tmp.bam)
+        gatk --java-options "-Xms3000m -Xmx3600m" SplitSamByNumberOfReads \
+            -I sorted_tmp.bam \
+            -O `pwd`/tmp/reverted \
+            --SPLIT_TO_N_READS {n_reads} \
+            --TOTAL_READS_IN_INPUT $total_reads \
+            --TMP_DIR `pwd`/tmp
+
+        ls `pwd`/tmp/reverted
+    """
+    )
+
+    j.command(f'mv `pwd`/tmp/reverted {j.reverted}')
+    b.write_output(j.reverted, f'{tmp_dir}/{output_bam_prefix}')
+
+    return j
+
+
+def revert_bam_to_ubam(
+        b: hb.batch.Batch,
+        input_bam: hb.resource.InputResourceFile = None,
+        output_bam_prefix: str = None,
+        disk_size: Union[float, int] = None,
+        img: str = 'docker.io/lindonkambule/gatk-bwa:v1.0',
+        memory: str = 'standard',
+        ncpu: int = 4,
+        tmp_dir: str = None
+) -> Job:
+    j = b.new_job(name=f'BamToUbam: {output_bam_prefix}')
+
+    j.cpu(ncpu)
+    j.image(img)
+    j.memory(memory)
+    j.storage(f'{disk_size}Gi')
+
+    java_mem = ncpu * 4 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
+
+    j.command(
+        f"""
+        cd /io
+        mkdir tmp/
+        mkdir tmp/reverted/
+        gatk --java-options -Xmx{java_mem}g RevertSam \
+            -I {input_bam} \
+            -O {j.output_bam} \
+            --MAX_DISCARD_FRACTION 0.005 \
+            --ATTRIBUTE_TO_CLEAR XT \
+            --ATTRIBUTE_TO_CLEAR XN \
+            --ATTRIBUTE_TO_CLEAR AS \
+            --ATTRIBUTE_TO_CLEAR OC \
+            --ATTRIBUTE_TO_CLEAR OP \
+            --OUTPUT_BY_READGROUP false \
+            --SORT_ORDER queryname \
+            --RESTORE_ORIGINAL_QUALITIES true \
+            --REMOVE_DUPLICATE_INFORMATION true \
+            --REMOVE_ALIGNMENT_INFORMATION true \
+            --VALIDATION_STRINGENCY SILENT \
+            --TMP_DIR `pwd`/tmp
+        """
+    )
+
+    j.command(
+        f"""
+        gatk --java-options "-Xms3000m -Xmx3600m" ValidateSamFile \
+            -I {j.output_bam} \
+            -MODE SUMMARY
+        """
+    )
+
+    b.write_output(j.output_bam, f'{tmp_dir}/{output_bam_prefix}.unmapped.bam')
+
+    return j
 
 
 # Some files are on CRAM version 2.0 which is not supported by GATK. We first convert them to BAM using samtools
@@ -100,8 +209,6 @@ def sam_to_fastq_and_bwa_mem_and_mba(
         output_bam_prefix: str = None,
         disk_size: Union[float, int] = None,
         img: str = 'docker.io/lindonkambule/gatk-bwa:v1.0',
-        # memory: str = 'standard',
-        # ncpu: int = 4,
         memory: str = '14Gi',
         ncpu: int = 16,
         tmp_dir: str = None

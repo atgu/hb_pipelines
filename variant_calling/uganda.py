@@ -59,7 +59,7 @@ def cram_to_bam_wrapper(
         bam_idx = [i for i in range(len(sample_bam_file_paths))]
 
         for bam, idx in zip(sample_bam_file_paths, bam_idx):
-            extension = os.path.splitext(os.path.basename(bam))
+            _, extension = os.path.splitext(os.path.basename(bam))
 
             bam_prefix = f'{sample_id}_{idx}'
             unmapped_bam_size = fun.size(bam)

@@ -68,8 +68,7 @@ def cram_to_bam_wrapper(
             ubam_exists = hfs.exists(f'{tmp_dir}/cram_to_ubam/{sample_id}/{bam_prefix}.unmapped.bam')
             if not ubam_exists:
                 if extension == '.cram':
-                    infile = b.read_input_group(**{'cram': bam,
-                                                   'md5': f'{bam}.md5'})
+                    infile = b.read_input(bam)
                     ubam = fun.revert_cram_to_ubam(
                         b=b,
                         input_cram=infile,

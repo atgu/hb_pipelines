@@ -135,7 +135,7 @@ def revert_bam_to_ubam(
 # (which handles older CRAM versions)
 def revert_cram_to_ubam(
         b: hb.batch.Batch,
-        input_cram: hb.ResourceGroup = None,
+        input_cram: hb.resource.InputResourceFile = None,
         old_ref_files: hb.ResourceGroup = None,
         output_bam_prefix: str = None,
         disk_size: Union[float, int] = None,
@@ -157,7 +157,7 @@ def revert_cram_to_ubam(
         f"""
         cd /io
 
-        samtools view -@{ncpu} -b -T {old_ref_files['ref_fasta']} -o tmp.bam {input_cram['cram']}
+        samtools view -@{ncpu} -b -T {old_ref_files['ref_fasta']} -o tmp.bam {input_cram}
         samtools index -@{ncpu} tmp.bam tmp.bam.bai
         """
     )

@@ -18,7 +18,7 @@ def mark_duplicates_wrapper(
         tmp_dir: str = None
 ):
     for sample_id, _ in samples_and_bams:
-        mapped_ls = hfs.ls(f'{tmp_dir}/mapped_bams/{sample_id}/**/*.bam')
+        mapped_ls = hfs.ls(f'{tmp_dir}/mapped_bams/{sample_id}/*.bam')
         mapped_bam_paths = [i.path for i in mapped_ls]
         mapped_bam_total_size = sum([jobs.size(i) for i in mapped_bam_paths])
         bams_mapped = [b.read_input(i) for i in mapped_bam_paths]

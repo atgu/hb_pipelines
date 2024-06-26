@@ -3,6 +3,7 @@ __author__ = 'Lindo Nkambule'
 import argparse
 from typing import List, Union
 import hailtop.batch as hb
+import hailtop.fs as hfs
 import pandas as pd
 from hailtop.batch.job import Job
 
@@ -63,16 +64,18 @@ def haplotype_caller(
         b: hb.batch.Batch,
         input_bam: Union[str, hb.ResourceGroup],
         interval_list_file: hb.ResourceFile,
-        job_name: str = None,
-        img: str = 'us.gcr.io/broad-gatk/gatk:4.2.6.1',
+        output_gvcf_name: str = None,
+        # img: str = 'us.gcr.io/broad-gatk/gatk:4.2.6.1',
+        img: str = 'docker.io/broadinstitute/gatk:latest',
         ncpu: int = 2,
-        storage: int = 2
+        storage: int = 2,
+        tmp_dir: str = None
 ) -> Job:
     """
     Call germline SNPs and indels
     """
 
-    j = b.new_job(name=f'HaplotypeCaller: {job_name}')
+    j = b.new_job(name=f'HaplotypeCaller: {output_gvcf_name}')
 
     j.declare_resource_group(
         output_gvcf={
@@ -98,9 +101,12 @@ def haplotype_caller(
             -G StandardAnnotation -G StandardHCAnnotation -G AS_StandardAnnotation \
             -GQB 10 -GQB 20 -GQB 30 -GQB 40 -GQB 50 -GQB 60 -GQB 70 -GQB 80 -GQB 90 \
             -ERC GVCF \
-            --gcs-max-retries 50 \
+            --gcs-max-retries 100 \
             --create-output-variant-index"""
     )
+
+    if tmp_dir:
+        b.write_output(j.output_gvcf, f'{tmp_dir}/scatter_{utils["haplotype_scatter_count"]}/{output_gvcf_name}')
 
     return j
 
@@ -110,7 +116,8 @@ def merge_gvcfs(
         gvcf_list: List[hb.ResourceGroup] = None,
         output_gvcf_name: str = None,
         img: str = 'us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.4.3-1564508330',
-        memory: int = 4,
+        memory: int = 8,
+        ncpu: int = 4,
         out_dir: str = None,
         storage: int = 100
 ) -> Job:
@@ -119,6 +126,7 @@ def merge_gvcfs(
     """
 
     input_cmdl = ' '.join([f'I={v["g.vcf.gz"]}' for v in gvcf_list])
+    java_mem = ncpu * 4    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
 
     j = b.new_job(name=f'Merge gVCFs: {output_gvcf_name}')
 
@@ -131,11 +139,12 @@ def merge_gvcfs(
 
     j.image(img)
     j.memory(f'{memory}Gi')
+    j.cpu(ncpu)
     j.storage(f'{storage}Gi')
 
     # merge
     j.command(
-        f"""java -Xms3000m -jar /usr/gitc/picard.jar \
+        f"""java -Xmx{java_mem}G -jar /usr/gitc/picard.jar \
             MergeVcfs \
             {input_cmdl} \
             O={j.output_gvcf['g.vcf.gz']}""")
@@ -187,15 +196,26 @@ def validate_gvcf(
 
 def run_gatk_hc(
         input_files: str = None,
+        steps: str = 'call,merge',
         out_dir: str = None,
+        tmp_dir: str = None,
         billing_project: str = None,
 ):
     """
     Call variants from CRAM/BAM for multiple samples in parallel
     """
+    steps_list = steps.split(',')
+    steps_to_run = [x.lower() for x in steps_list]
+    unknown_steps = [i for i in steps_to_run if i not in ['call', 'merge']]
+
+    if len(unknown_steps) > 0:
+        raise SystemExit(f'Incorrect process(es) {unknown_steps} selected. Options are [call, merge]')
+
+    print(f'--- Steps to run: {steps_to_run} ---')
+
     backend = hb.ServiceBackend(
         billing_project=billing_project,
-        remote_tmpdir=f'{out_dir}/gatk4_hc/',
+        remote_tmpdir=tmp_dir,
     )
 
     b = hb.Batch(
@@ -208,36 +228,49 @@ def run_gatk_hc(
     files = [(sample, bam_path) for sample, bam_path in zip(bams['id'], bams['files'])]
 
     # 1. split intervals
-    intervals = split_interval_list(
-        b=b
-    )
+    if 'call' in steps_to_run:
+        intervals = split_interval_list(
+            b=b
+        )
 
     for sample_id, bam in files:
         # 2. HC scattered mode
-        scattered_gvcfs = [
-            haplotype_caller(
-                b=b,
-                input_bam=bam,
-                interval_list_file=intervals[f'interval_{idx}.interval_list'],
-                job_name=f'{sample_id}_{idx}'
-            ).output_gvcf
-            for idx in range(utils['haplotype_scatter_count'])
-        ]
+        if 'call' in steps_to_run:
+            scattered_gvcfs = [
+                haplotype_caller(
+                    b=b,
+                    input_bam=bam,
+                    interval_list_file=intervals[f'interval_{idx}.interval_list'],
+                    output_gvcf_name=f'{sample_id}_{idx}',
+                    tmp_dir=tmp_dir
+                ).output_gvcf
+                for idx in range(utils['haplotype_scatter_count'])
+            ]
+        else:
+            p = f'{tmp_dir}/scatter_{utils["haplotype_scatter_count"]}'
+            scattered_gvcfs = [b.read_input_group(**{'g.vcf.gz': f'{p}/{sample_id}_{idx}',
+                                                     'g.vcf.gz.tbi': f'{p}/{sample_id}_{idx}.bai'})
+                               for idx in range(utils['haplotype_scatter_count'])]
 
         # 3. Gather gvcfs and index
-        merged_gvcf_j = merge_gvcfs(
-            b=b,
-            gvcf_list=scattered_gvcfs,
-            output_gvcf_name=sample_id,
-            out_dir=f'{out_dir}/gvcfs/'
-        ).output_gvcf
+        if 'merge' in steps_to_run:
+            if not hfs.exists(f'{out_dir}/gvcfs/{sample_id}.g.vcf.gz'):
+                merged_gvcf = merge_gvcfs(
+                    b=b,
+                    gvcf_list=scattered_gvcfs,
+                    output_gvcf_name=sample_id,
+                    out_dir=f'{out_dir}/gvcfs/'
+                ).output_gvcf
+            else:
+                merged_gvcf = b.read_input_group(**{'g.vcf.gz': f'{out_dir}/gvcfs/{sample_id}.g.vcf.gz',
+                                                    'g.vcf.gz.tbi': f'{out_dir}/gvcfs/{sample_id}.g.vcf.gz.tbi'})
 
-        # 4. Index and validate GVCF
-        validate_gvcf(
-            b=b,
-            input_gvcf=merged_gvcf_j,
-            job_name=sample_id
-            )
+            # 4. Index and validate GVCF
+            validate_gvcf(
+                b=b,
+                input_gvcf=merged_gvcf,
+                job_name=sample_id
+                )
 
     b.run()
 
@@ -246,11 +279,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-files', type=str, required=True)
     parser.add_argument('--out-dir', type=str, required=True)
+    parser.add_argument('--tmp-dir', type=str, required=True)
+    parser.add_argument('--steps', type=str, default='call,merge')
     parser.add_argument('--billing-project', type=str, required=True)
 
     args = parser.parse_args()
 
-    run_gatk_hc(input_files=args.input_files, out_dir=args.out_dir, billing_project=args.billing_project)
+    run_gatk_hc(input_files=args.input_files, out_dir=args.out_dir, tmp_dir=args.tmp_dir,
+                billing_project=args.billing_project)
 
 
 if __name__ == '__main__':

@@ -107,7 +107,7 @@ def cram_to_bam_wrapper(
 def mark_duplicates_wrapper(
         b: hb.Batch,
         samples_and_bams: List[Tuple[str, str]],
-        additional_disk: float = 20.0,
+        additional_disk: float = 30.0,
         md_disk_multiplier: float = 2.25,
         tmp_dir: str = None
 ):

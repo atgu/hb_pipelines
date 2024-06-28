@@ -51,7 +51,7 @@ def cram_to_bam_wrapper(
         bwa_ref_files: hb.ResourceGroup = None,
         ref_files_size: float = None,
         bwa_disk_multiplier: float = 2.5,
-        additional_disk: float = 20.0,
+        additional_disk: float = 40.0,
         tmp_dir: str = None
 ):
     for sample_id, sample_bams in samples_and_bams:
@@ -74,7 +74,7 @@ def cram_to_bam_wrapper(
                         input_cram=infile,
                         output_bam_prefix=bam_prefix,
                         old_ref_files=old_ref_files,
-                        disk_size=round(unmapped_bam_size + 2.0*unmapped_bam_size + ref_files_size + additional_disk),
+                        disk_size=round(unmapped_bam_size + 3.0*unmapped_bam_size + ref_files_size + additional_disk),
                         tmp_dir=f'{tmp_dir}/cram_to_ubam/{sample_id}'
                     ).output_bam
                 else:
@@ -83,7 +83,7 @@ def cram_to_bam_wrapper(
                         b=b,
                         input_bam=infile,
                         output_bam_prefix=bam_prefix,
-                        disk_size=round(unmapped_bam_size + 2.0*unmapped_bam_size + additional_disk),
+                        disk_size=round(unmapped_bam_size + 3.0*unmapped_bam_size + additional_disk),
                         tmp_dir=f'{tmp_dir}/cram_to_ubam/{sample_id}'
                     ).output_bam
             else:

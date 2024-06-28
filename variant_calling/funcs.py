@@ -209,7 +209,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
         output_bam_prefix: str = None,
         disk_size: Union[float, int] = None,
         img: str = 'docker.io/lindonkambule/gatk-bwa:v1.0',
-        memory: str = '14Gi',
+        memory: str = '16G',
         ncpu: int = 16,
         tmp_dir: str = None
 ) -> Job:

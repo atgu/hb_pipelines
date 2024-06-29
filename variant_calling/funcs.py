@@ -21,13 +21,14 @@ def size(file: str):
     return size_gigs
 
 
+# https://github.com/gatk-workflows/five-dollar-genome-analysis-pipeline/blob/b33decd14b550ad157a948ad720166040e435890/tasks/SplitLargeReadGroup.wdl#L41
 def split_by_num_reads(
         b: hb.batch.Batch,
         input_bam: hb.resource.InputResourceFile,
         output_bam_prefix: str = None,
         disk_size: Union[float, int] = None,
-        n_reads: int = 1_000_000,
-        ncpu: int = 8,
+        n_reads: int = 48000000,
+        ncpu: int = 4,
         docker: str = 'docker.io/broadinstitute/gatk:latest',
         tmp_dir: str = None
 ) -> Job:
@@ -39,10 +40,12 @@ def split_by_num_reads(
     j.cpu(ncpu)
     j.storage(f'{disk_size}Gi')
 
+    java_mem = ncpu * 4
+
     j.command(
         f"""cd /io
         mkdir tmp/
-        gatk --java-options "-Xms3000m -Xmx3600m" SortSam \
+        gatk --java-options "-Xms3000m -Xmx{java_mem}g" SortSam \
             -I {input_bam} \
             -O sorted_tmp.bam \
             -SO queryname \
@@ -58,7 +61,7 @@ def split_by_num_reads(
         mkdir tmp/reverted/
                     
         total_reads=$(samtools view -c sorted_tmp.bam)
-        gatk --java-options "-Xms3000m -Xmx3600m" SplitSamByNumberOfReads \
+        gatk --java-options "-Xms3000m -Xmx{java_mem}g" SplitSamByNumberOfReads \
             -I sorted_tmp.bam \
             -O `pwd`/tmp/reverted \
             --SPLIT_TO_N_READS {n_reads} \
@@ -190,7 +193,7 @@ def revert_cram_to_ubam(
 
     j.command(
         f"""
-        gatk --java-options "-Xms3000m -Xmx3600m" ValidateSamFile \
+        gatk --java-options "-Xms3000m -Xmx{java_mem}g" ValidateSamFile \
             -I {j.output_bam} \
             -MODE SUMMARY
         """
@@ -220,7 +223,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
     j.memory(memory)
     j.storage(f'{disk_size}Gi')
 
-    java_mem = ncpu * 4 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
+    java_mem = ncpu * 16 - 10    # ‘lowmem’ ~1Gi/core, ‘standard’ ~4Gi/core, and ‘highmem’ ~7Gi/core in Hail Batch
 
     j.command(f"""
         bwa_version=$(bwa 2>&1 | grep -e '^Version' | sed 's/Version: //')
@@ -239,7 +242,7 @@ def sam_to_fastq_and_bwa_mem_and_mba(
             if [ -s {bwa_ref_files['ref_alt']} ]; then
               samtools fastq -OT RG,BC {input_ubam} |
               bwa mem -K 100000000 -pt{ncpu} -v 3 -Y {bwa_ref_files['ref_fasta']} /dev/stdin - > {output_bam_prefix}.sam
-              gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms5000m -Xmx{java_mem}g" MergeBamAlignment \
+              gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms3000m -Xmx{java_mem}g" MergeBamAlignment \
                 --VALIDATION_STRINGENCY SILENT \
                 --EXPECTED_ORIENTATIONS FR \
                 --ATTRIBUTES_TO_RETAIN X0 \
@@ -290,7 +293,7 @@ def mark_duplicates(
         compression_level: int = 2,
         disk_size: Union[float, int] = None,
         img: str = 'docker.io/broadinstitute/gatk:latest',
-        memory: float = 8,
+        memory: str = '8G',
         ncpu: int = 2,
         tmp_dir: str = None
 ) -> Job:
@@ -303,14 +306,14 @@ def mark_duplicates(
 
     j.cpu(ncpu)
     j.image(img)
-    j.memory(f'{memory}Gi')
+    j.memory(memory)
     j._preemptible = use_preemptible_worker
     j.storage(f'{disk_size}Gi')
     j.command(
         f"""
         cd /io
         mkdir tmp/
-        gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms4000m" MarkDuplicates \
+        gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms3000m -Xmx6000m" MarkDuplicates \
             {bams_rg} \
             -O {j.output_bam} \
             -M {j.markdup_metrics} \
@@ -363,7 +366,7 @@ def picard_sort_bam(
     j.command(
         f"""cd /io
         mkdir tmp/
-        gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xms5000m" SortSam \
+        gatk --java-options "-Dsamjdk.compression_level={compression_level} -Xmx5000m" SortSam \
             -I {input_bam} \
             -O {j.output_bam['bam']} \
             -SO coordinate \

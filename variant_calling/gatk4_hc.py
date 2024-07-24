@@ -15,7 +15,7 @@ utils = {"ref_fasta": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapie
          "eval_int_list": "gs://gcp-public-data--broad-references/hg38/v0/wgs_evaluation_regions.hg38.interval_list",
          "dbsnp_resource_vcf": "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.gz",
          "hc_contamination": 0,
-         "haplotype_scatter_count": 150,
+         "haplotype_scatter_count": 50,
          "break_bands_at_multiples_of": 1000000
          }
 

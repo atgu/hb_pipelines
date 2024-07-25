@@ -259,7 +259,7 @@ def run_gatk_hc(
                     b=b,
                     gvcf_list=scattered_gvcfs,
                     output_gvcf_name=sample_id,
-                    out_dir=f'{out_dir}/gvcfs/'
+                    out_dir=f'{out_dir}/gvcfs'
                 ).output_gvcf
             else:
                 merged_gvcf = b.read_input_group(**{'g.vcf.gz': f'{out_dir}/gvcfs/{sample_id}.g.vcf.gz',
